@@ -3,6 +3,14 @@ name: Build Project Churro for Pixelbook Go (ATLAS)
 on:
   workflow_dispatch:
     inputs:
+      build_mode:
+        description: 'Build Mode (fast_patch = ~6 min using latest release; full_build = ~30 min from scratch)'
+        required: true
+        default: 'fast_patch'
+        type: choice
+        options:
+          - 'fast_patch'
+          - 'full_build'
       apply_latest_ota:
         description: 'Apply Latest Google OTA Delta Before Building'
         required: true
@@ -35,6 +43,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install & Verify Project Churro, LLVM 18 & SPIRV-Tools Dependencies
+        if: ${{ inputs.build_mode == 'full_build' }}
         run: |
           set -euo pipefail
           export DEBIAN_FRONTEND=noninteractive
@@ -55,7 +64,7 @@ jobs:
             binutils lz4 zstd xz-utils bzip2 build-essential flex bison bc rsync pkg-config \
             cmake ninja-build meson libssl-dev libelf-dev libdw-dev zlib1g-dev \
             autoconf automake libtool liblz4-dev uuid-dev libselinux1-dev libsepol-dev checkpolicy default-jre-headless \
-            gettext autopoint gperf texinfo kpartx e2fsprogs erofs-utils mtools xorriso
+            gettext autopoint gperf texinfo kpartx e2fsprogs erofs-utils mtools xorriso pigz attr
 
           # 2. Install exact Mesa 26 host-tools dependencies (from gfx/build-mesa.sh + spirv-tools)
           sudo apt-get -o Acquire::Retries=5 install -y --fix-missing \
@@ -74,6 +83,7 @@ jobs:
           echo "[*] Verified SPIRV-Tools: $(pkg-config --modversion SPIRV-Tools), LLVMSPIRVLib: $(pkg-config --modversion LLVMSPIRVLib), llvm-config: $(llvm-config --version)"
 
       - name: Clone Project Churro & Pixelbook Go (ATLAS) Hardware Sources
+        if: ${{ inputs.build_mode == 'full_build' }}
         run: |
           set -euo pipefail
           WORKDIR="$GITHUB_WORKSPACE/churro-build"
@@ -100,6 +110,7 @@ jobs:
           fi
 
       - name: Stage Pixelbook Go (ATLAS) Audio, Webcam, Bluetooth, Sleep, Display & 160 DPI Fixes
+        if: ${{ inputs.build_mode == 'full_build' }}
         run: |
           set -euo pipefail
           WORKDIR="$GITHUB_WORKSPACE/churro-build"
@@ -172,7 +183,7 @@ jobs:
           open(p, "w").write(src)
           PY_MIXER
 
-          # 6. Update features/audio-generic/patch-vendor.sh for AVS PCM 1 configs, i965_drv_video.so camera VA-API symlink, and Blur toggle
+          # 6. Update features/audio-generic/patch-vendor.sh for AVS PCM 0 configs, i965_drv_video.so camera VA-API symlink, and Blur toggle
           python3 - << 'PY_VENDOR'
           import re
           p = "features/audio-generic/patch-vendor.sh"
@@ -243,6 +254,7 @@ jobs:
           PY_ESP
 
       - name: Download Official Googlebook Recovery Image & Build Project Churro
+        if: ${{ inputs.build_mode == 'full_build' }}
         env:
           APPLY_LATEST_OTA: ${{ inputs.apply_latest_ota }}
           DEBIAN_FRONTEND: noninteractive
@@ -291,7 +303,7 @@ jobs:
 
           echo "[*] Compressing and chunking into 1900MB parts (GitHub 2 GB release asset limit)..."
           cd out
-          gzip -c churro-pixelbook-go-atlas.img | split -b 1900M - churro-pixelbook-go-atlas.img.gz.part-
+          pigz -p "$(nproc)" -c churro-pixelbook-go-atlas.img | split -b 1900M - churro-pixelbook-go-atlas.img.gz.part-
           rm -f churro-pixelbook-go-atlas.img
 
           cat << 'WIN_BAT' > REASSEMBLE.bat
@@ -314,6 +326,142 @@ jobs:
 
           ls -lh churro-pixelbook-go-atlas.img.gz.part-*
 
+      - name: Fast Patch Latest Release Image (~6 min)
+        if: ${{ inputs.build_mode == 'fast_patch' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pigz gdisk erofs-utils attr git gcc libc6-dev
+
+          WORKDIR="$GITHUB_WORKSPACE/fast-patch"
+          mkdir -p "$WORKDIR/dl" "$WORKDIR/out"
+          cd "$WORKDIR"
+
+          echo "[*] Downloading latest release parts from $GITHUB_REPOSITORY..."
+          gh release download --repo "$GITHUB_REPOSITORY" --pattern "churro-pixelbook-go-atlas.img.gz.part-*" -D "$WORKDIR/dl"
+
+          echo "[*] Decompressing image with pigz..."
+          cat "$WORKDIR/dl"/churro-pixelbook-go-atlas.img.gz.part-* | pigz -dc > "$WORKDIR/atlas.img"
+          rm -rf "$WORKDIR/dl"
+
+          # 1. Patch /churro/grub.cfg on EFI-SYSTEM
+          EFI_INFO="$(sgdisk -p "$WORKDIR/atlas.img" | awk '$6=="EF00" || $7=="EFI-SYSTEM" {print $2, $3; exit}')"
+          EFI_START="$(echo "$EFI_INFO" | awk '{print $1}')"
+          mkdir -p "$WORKDIR/esp"
+          sudo mount -o loop,offset=$((EFI_START * 512)) "$WORKDIR/atlas.img" "$WORKDIR/esp"
+          sudo python3 - << 'PY_GRUB'
+          import re, glob
+          cfgs = glob.glob("esp/churro/grub.cfg") + glob.glob("**/esp/churro/grub.cfg", recursive=True)
+          cfg = cfgs[0]
+          s = open(cfg).read()
+          extra = " snd_intel_dspcfg.dsp_driver=4 mem_sleep_default=deep i915.enable_psr=0 i915.enable_fbc=0"
+          def add_args(m):
+              line = m.group(0)
+              return line if "mem_sleep_default=deep" in line else line + extra
+          s2 = re.sub(r'^\s*linux\s+.*churro/kernel[^\n]*', add_args, s, flags=re.M)
+          open(cfg, "w").write(s2)
+          print("[*] Patched grub.cfg")
+          PY_GRUB
+          sudo umount "$WORKDIR/esp"
+
+          # 2. Extract vendor_a partition
+          V_INFO="$(sgdisk -p "$WORKDIR/atlas.img" | awk '$7=="vendor_a" {print $2, $3; exit}')"
+          V_START="$(echo "$V_INFO" | awk '{print $1}')"
+          V_END="$(echo "$V_INFO" | awk '{print $2}')"
+          V_SECTORS=$((V_END - V_START + 1))
+          V_BYTES=$((V_SECTORS * 512))
+          echo "[*] Extracting vendor_a (start=$V_START, sectors=$V_SECTORS)..."
+          dd if="$WORKDIR/atlas.img" of="$WORKDIR/vendor_a.img" bs=512 skip="$V_START" count="$V_SECTORS" status=progress
+
+          if command -v extract.erofs >/dev/null 2>&1; then
+            sudo extract.erofs -x -i "$WORKDIR/vendor_a.img" -o "$WORKDIR/vendor_dir"
+          else
+            sudo fsck.erofs --extract="$WORKDIR/vendor_dir" "$WORKDIR/vendor_a.img"
+          fi
+          rm -f "$WORKDIR/vendor_a.img"
+
+          # 3. Clone project-churro for churro-mixer.c and recompile it statically
+          git clone --depth 1 https://github.com/alesimula/project-churro.git "$WORKDIR/pc"
+          python3 - << 'PY_MIX'
+          import re
+          p = "pc/features/audio-generic/churro-mixer.c"
+          src = open(p).read()
+          new_sw = '''int sw = ((strstr(name, "Playback Switch") || strstr(name, "Speaker Switch") ||
+                     strstr(name, "Spk") || strstr(name, "Headphone Switch") ||
+                     strstr(name, "Sense") || strstr(name, "Enable Switch") ||
+                     strstr(name, "DHT") || strstr(name, "BDE") ||
+                     strstr(name, "DACL Switch") || strstr(name, "DACR Switch")) &&
+                    !strstr(name, "Beep")) || !strcmp(name, "Capture Switch");'''
+          new_vol = '''int vol = !strcmp(name, "Master Playback Volume") || !strcmp(name, "DSP") ||
+                    strstr(name, "Left Speaker") || strstr(name, "Right Speaker") ||
+                    strstr(name, "Digital Volume") || strstr(name, "Speaker Gain") ||
+                    strstr(name, "Headphone Volume") || strstr(name, "Capture Volume");'''
+          src = re.sub(r'int\s+sw\s*=[^;]+;', new_sw, src, count=1, flags=re.S)
+          src = re.sub(r'int\s+vol\s*=[^;]+;', new_vol, src, count=1, flags=re.S)
+          open(p, "w").write(src)
+          PY_MIX
+          gcc -O2 -static -o "$WORKDIR/churro-mixer" "$WORKDIR/pc/features/audio-generic/churro-mixer.c"
+          MIX_CTX="$(sudo getfattr -n security.selinux --only-values "$WORKDIR/vendor_dir/bin/churro-mixer" 2>/dev/null || echo 'u:object_r:vendor_file:s0')"
+          sudo cp -f "$WORKDIR/churro-mixer" "$WORKDIR/vendor_dir/bin/churro-mixer"
+          sudo chmod 0755 "$WORKDIR/vendor_dir/bin/churro-mixer"
+          sudo setfattr -n security.selinux -v "$MIX_CTX" "$WORKDIR/vendor_dir/bin/churro-mixer" 2>/dev/null || true
+
+          # 4. Fix audio_config.xml (hw:${W},0 + SELinux label)
+          for avs_d in avsmax98373 MAX98373 avsda7219 DA7219; do
+            CFG="$WORKDIR/vendor_dir/etc/audio/$avs_d/audio_config.xml"
+            if sudo test -f "$CFG"; then
+              sudo sed -i 's|<PlaybackPCM>hw:\(${W}\),1</PlaybackPCM>|<PlaybackPCM>hw:\1,0</PlaybackPCM>|g; s|<PlaybackPCM>hw:\([0-9]*\),1</PlaybackPCM>|<PlaybackPCM>hw:\1,0</PlaybackPCM>|g' "$CFG"
+              sudo setfattr -n security.selinux -v u:object_r:vendor_configs_file:s0 "$CFG"
+            fi
+          done
+
+          # 5. Update vendor/build.prop + init.churro.atlas.rc (remove SELinux-blocked churro-atlas-init.sh)
+          sudo rm -f "$WORKDIR/vendor_dir/bin/churro-atlas-init.sh"
+          BP="$WORKDIR/vendor_dir/build.prop"
+          BP_CTX="$(sudo getfattr -n security.selinux --only-values "$BP" 2>/dev/null || echo 'u:object_r:vendor_file:s0')"
+          sudo sed -i '/^persist\.bluetooth\.a2dp_offload\.disabled=/d' "$BP"
+          echo "persist.bluetooth.a2dp_offload.disabled=false" | sudo tee -a "$BP" >/dev/null
+          sudo setfattr -n security.selinux -v "$BP_CTX" "$BP" 2>/dev/null || true
+
+          cat << 'ATLAS_RC' | sudo tee "$WORKDIR/vendor_dir/etc/init/init.churro.atlas.rc" >/dev/null
+          on early-init
+              setprop ro.sf.lcd_density 160
+              setprop persist.sys.dpi 160
+              setprop persist.aicore.enabled false
+
+          on property:sys.boot_completed=1
+              setprop persist.bluetooth.a2dp_offload.disabled false
+              setprop persist.sys.sf.disable_blurs 0
+              setprop service.adb.tcp.port 5555
+              setprop persist.adb.tcp.port 5555
+              write /sys/power/mem_sleep deep
+              chmod 0666 /sys/class/leds/chromeos::kbd_backlight/brightness
+              write /sys/class/leds/chromeos::kbd_backlight/brightness 40
+              exec u:r:get_variant_audio:s0 -- /vendor/bin/churro-mixer 0
+              exec u:r:get_variant_audio:s0 -- /vendor/bin/churro-mixer 1
+              exec u:r:get_variant_audio:s0 -- /vendor/bin/churro-mixer 2
+          ATLAS_RC
+          sudo sed -i 's/^          //' "$WORKDIR/vendor_dir/etc/init/init.churro.atlas.rc"
+          sudo chmod 0644 "$WORKDIR/vendor_dir/etc/init/init.churro.atlas.rc"
+          sudo setfattr -n security.selinux -v u:object_r:vendor_configs_file:s0 "$WORKDIR/vendor_dir/etc/init/init.churro.atlas.rc"
+
+          # 6. Repack vendor_a with mkfs.erofs and write back
+          sudo mkfs.erofs -zlz4hc,9 "$WORKDIR/vendor_new.img" "$WORKDIR/vendor_dir"
+          NEW_BYTES=$(stat -c%s "$WORKDIR/vendor_new.img")
+          echo "[*] New vendor_a size: $NEW_BYTES bytes (max $V_BYTES bytes)"
+          [ "$NEW_BYTES" -le "$V_BYTES" ]
+          dd if="$WORKDIR/vendor_new.img" of="$WORKDIR/atlas.img" bs=512 seek="$V_START" conv=notrunc status=progress
+          sudo rm -rf "$WORKDIR/vendor_dir" "$WORKDIR/vendor_new.img" "$WORKDIR/pc" "$WORKDIR/churro-mixer"
+
+          # 7. Compress with multi-core pigz and split for release upload
+          mkdir -p "$GITHUB_WORKSPACE/churro-build/project-churro/out"
+          cd "$GITHUB_WORKSPACE/churro-build/project-churro/out"
+          pigz -p "$(nproc)" -c "$WORKDIR/atlas.img" | split -b 1900M - churro-pixelbook-go-atlas.img.gz.part-
+          rm -f "$WORKDIR/atlas.img"
+          ls -lh churro-pixelbook-go-atlas.img.gz.part-*
+
       - name: Upload Flashable Project Churro Image Parts to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
@@ -324,7 +472,7 @@ jobs:
             - **Graphics**: Native Mesa Intel Drivers (`iris` / `crocus` / `intel_hasvk` / `Zink`) + Rebuilt `minigbm` Allocator for Intel UHD Graphics 615 (Gen 9.5) + `i965_drv_video.so` VA-API symlink + SurfaceFlinger Blur
             - **CPU & Crypto**: Recompiled BoringSSL (`libcrypto.so` + `libcrypto_httpengine.so`) for Amber Lake / Haswell+ CPUs + Kernel `vex-emulate` handler
             - **Display & Sleep**: Pre-configured `1920x1080` at `160 DPI`, S3 `deep` sleep (`mem_sleep_default=deep`), and `i915.enable_psr=0 i915.enable_fbc=0` black-screen fix in `/churro/grub.cfg`
-            - **Audio, Webcam & Bluetooth**: Intel cAVS 1.5 DSP (`SND_SOC_INTEL_AVS`, `dsp_driver=4`) + `MAX98373` speakers + `DA7219` headphone jack (`PCM 1`) + `uvcvideo` Duo Cam webcam + Bluetooth A2DP audio enabled
+            - **Audio, Webcam & Bluetooth**: Intel cAVS 1.5 DSP (`SND_SOC_INTEL_AVS`, `dsp_driver=4`) + `MAX98373` speakers + `DA7219` headphone jack (`PCM 0`) + Bluetooth A2DP audio enabled
           files: |
             churro-build/project-churro/out/churro-pixelbook-go-atlas.img.gz.part-*
             churro-build/project-churro/out/REASSEMBLE.bat
