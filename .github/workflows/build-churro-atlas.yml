@@ -501,8 +501,14 @@ jobs:
           sudo chmod 0644 "$WORKDIR/vendor_dir/etc/init/init.churro.atlas.rc"
           sudo setfattr -n security.selinux -v u:object_r:vendor_configs_file:s0 "$WORKDIR/vendor_dir/etc/init/init.churro.atlas.rc"
 
-          # 6. Repack vendor_a with mkfs.erofs and write back into exact extent(s)
-          sudo mkfs.erofs -zlz4hc,9 "$WORKDIR/vendor_new.img" "$WORKDIR/vendor_dir"
+          # 6. Repack vendor_a with mkfs.erofs (max lz4hc, falling back to lzma if needed to fit slot)
+          MAX_BYTES=$(python3 -c 'import json; print(sum(x[1] for x in json.load(open("vendor_extents.json"))))')
+          sudo mkfs.erofs -zlz4hc,12 -C 65536 "$WORKDIR/vendor_new.img" "$WORKDIR/vendor_dir"
+          if [ "$(stat -c%s "$WORKDIR/vendor_new.img")" -gt "$MAX_BYTES" ]; then
+            echo "[*] lz4hc,12 exceeded slot ($MAX_BYTES bytes); repacking with lzma..."
+            sudo rm -f "$WORKDIR/vendor_new.img"
+            sudo mkfs.erofs -zlzma "$WORKDIR/vendor_new.img" "$WORKDIR/vendor_dir"
+          fi
           python3 - << 'PY_WRITE'
           import json, os
           extents = json.load(open("vendor_extents.json"))
