@@ -183,7 +183,7 @@ jobs:
           open(p, "w").write(src)
           PY_MIXER
 
-          # 6. Update features/audio-generic/patch-vendor.sh for AVS PCM 0 configs, i965_drv_video.so camera VA-API symlink, and Blur toggle
+          # 6. Update features/audio-generic/patch-vendor.sh for AVS PCM 1 configs, i965_drv_video.so camera VA-API symlink, and Blur toggle
           python3 - << 'PY_VENDOR'
           import re
           p = "features/audio-generic/patch-vendor.sh"
@@ -352,7 +352,9 @@ jobs:
           mkdir -p "$WORKDIR/esp"
           sudo mount -o loop,offset=$((EFI_START * 512)) "$WORKDIR/atlas.img" "$WORKDIR/esp"
           sudo python3 - << 'PY_GRUB'
-          import re, glob
+          import re
+          p = "/home/runner/work"
+          import glob
           cfgs = glob.glob("esp/churro/grub.cfg") + glob.glob("**/esp/churro/grub.cfg", recursive=True)
           cfg = cfgs[0]
           s = open(cfg).read()
@@ -366,14 +368,66 @@ jobs:
           PY_GRUB
           sudo umount "$WORKDIR/esp"
 
-          # 2. Extract vendor_a partition
-          V_INFO="$(sgdisk -p "$WORKDIR/atlas.img" | awk '$7=="vendor_a" {print $2, $3; exit}')"
-          V_START="$(echo "$V_INFO" | awk '{print $1}')"
-          V_END="$(echo "$V_INFO" | awk '{print $2}')"
-          V_SECTORS=$((V_END - V_START + 1))
-          V_BYTES=$((V_SECTORS * 512))
-          echo "[*] Extracting vendor_a (start=$V_START, sectors=$V_SECTORS)..."
-          dd if="$WORKDIR/atlas.img" of="$WORKDIR/vendor_a.img" bs=512 skip="$V_START" count="$V_SECTORS" status=progress
+          # 2. Extract vendor_a (either direct GPT partition or logical partition inside super)
+          sgdisk -p "$WORKDIR/atlas.img"
+          python3 - << 'PY_EXTRACT'
+          import json, re, struct, subprocess
+          img = "atlas.img"
+          gpt = subprocess.check_output(["sgdisk", "-p", img], text=True)
+          def find_part(name):
+              for line in gpt.splitlines():
+                  cols = line.split()
+                  if cols and cols[0].isdigit() and cols[-1] == name:
+                      return int(cols[1]), int(cols[2])
+              return None
+
+          extents = []
+          v = find_part("vendor_a")
+          if v:
+              s, e = v
+              extents = [(s * 512, (e - s + 1) * 512)]
+              print(f"[*] Found direct GPT vendor_a: start={s}, sectors={e-s+1}")
+          else:
+              sup = find_part("super")
+              assert sup, "Neither vendor_a nor super found in GPT!"
+              sup_off = sup[0] * 512
+              with open(img, "rb") as f:
+                  f.seek(sup_off + 12288)
+                  hdr = f.read(128)
+                  magic, maj, minv, hdr_size = struct.unpack_from("<IHHI", hdr, 0)
+                  assert magic == 0x414c5030, f"Bad liblp magic: {hex(magic)}"
+                  p_off, p_num, p_sz = struct.unpack_from("<III", hdr, 80)
+                  e_off, e_num, e_sz = struct.unpack_from("<III", hdr, 92)
+                  tbl_base = sup_off + 12288 + hdr_size
+                  f.seek(tbl_base + p_off)
+                  parts_raw = f.read(p_num * p_sz)
+                  f.seek(tbl_base + e_off)
+                  exts_raw = f.read(e_num * e_sz)
+                  target = None
+                  for i in range(p_num):
+                      name_b, attrs, first_e, num_e, grp = struct.unpack_from("<36sIIII", parts_raw, i * p_sz)
+                      name = name_b.split(b"\x00", 1)[0].decode("utf-8", "ignore")
+                      if name == "vendor_a":
+                          target = (first_e, num_e)
+                          break
+                  assert target, "vendor_a not found inside super!"
+                  for j in range(target[0], target[0] + target[1]):
+                      n_sec, t_type, t_data, t_src = struct.unpack_from("<QIQI", exts_raw, j * e_sz)
+                      assert t_type == 0, f"Non-linear extent type: {t_type}"
+                      extents.append((sup_off + t_data * 512, n_sec * 512))
+                  print(f"[*] Found vendor_a inside super ({len(extents)} extent(s), {sum(x[1] for x in extents)} bytes)")
+
+          with open("vendor_extents.json", "w") as jf:
+              json.dump(extents, jf)
+          with open(img, "rb") as fin, open("vendor_a.img", "wb") as fout:
+              for off, length in extents:
+                  fin.seek(off)
+                  rem = length
+                  while rem > 0:
+                      chunk = fin.read(min(rem, 16 * 1024 * 1024))
+                      fout.write(chunk)
+                      rem -= len(chunk)
+          PY_EXTRACT
 
           if command -v extract.erofs >/dev/null 2>&1; then
             sudo extract.erofs -x -i "$WORKDIR/vendor_a.img" -o "$WORKDIR/vendor_dir"
@@ -447,12 +501,23 @@ jobs:
           sudo chmod 0644 "$WORKDIR/vendor_dir/etc/init/init.churro.atlas.rc"
           sudo setfattr -n security.selinux -v u:object_r:vendor_configs_file:s0 "$WORKDIR/vendor_dir/etc/init/init.churro.atlas.rc"
 
-          # 6. Repack vendor_a with mkfs.erofs and write back
+          # 6. Repack vendor_a with mkfs.erofs and write back into exact extent(s)
           sudo mkfs.erofs -zlz4hc,9 "$WORKDIR/vendor_new.img" "$WORKDIR/vendor_dir"
-          NEW_BYTES=$(stat -c%s "$WORKDIR/vendor_new.img")
-          echo "[*] New vendor_a size: $NEW_BYTES bytes (max $V_BYTES bytes)"
-          [ "$NEW_BYTES" -le "$V_BYTES" ]
-          dd if="$WORKDIR/vendor_new.img" of="$WORKDIR/atlas.img" bs=512 seek="$V_START" conv=notrunc status=progress
+          python3 - << 'PY_WRITE'
+          import json, os
+          extents = json.load(open("vendor_extents.json"))
+          max_bytes = sum(x[1] for x in extents)
+          new_bytes = os.path.getsize("vendor_new.img")
+          print(f"[*] New vendor_a size: {new_bytes} bytes (max {max_bytes} bytes)")
+          assert new_bytes <= max_bytes, f"vendor_new.img ({new_bytes}) exceeds slot ({max_bytes})!"
+          with open("vendor_new.img", "rb") as fin, open("atlas.img", "r+b") as fout:
+              for off, length in extents:
+                  fout.seek(off)
+                  data = fin.read(length)
+                  if len(data) < length:
+                      data += b"\x00" * (length - len(data))
+                  fout.write(data)
+          PY_WRITE
           sudo rm -rf "$WORKDIR/vendor_dir" "$WORKDIR/vendor_new.img" "$WORKDIR/pc" "$WORKDIR/churro-mixer"
 
           # 7. Compress with multi-core pigz and split for release upload
@@ -472,7 +537,7 @@ jobs:
             - **Graphics**: Native Mesa Intel Drivers (`iris` / `crocus` / `intel_hasvk` / `Zink`) + Rebuilt `minigbm` Allocator for Intel UHD Graphics 615 (Gen 9.5) + `i965_drv_video.so` VA-API symlink + SurfaceFlinger Blur
             - **CPU & Crypto**: Recompiled BoringSSL (`libcrypto.so` + `libcrypto_httpengine.so`) for Amber Lake / Haswell+ CPUs + Kernel `vex-emulate` handler
             - **Display & Sleep**: Pre-configured `1920x1080` at `160 DPI`, S3 `deep` sleep (`mem_sleep_default=deep`), and `i915.enable_psr=0 i915.enable_fbc=0` black-screen fix in `/churro/grub.cfg`
-            - **Audio, Webcam & Bluetooth**: Intel cAVS 1.5 DSP (`SND_SOC_INTEL_AVS`, `dsp_driver=4`) + `MAX98373` speakers + `DA7219` headphone jack (`PCM 0`) + Bluetooth A2DP audio enabled
+            - **Audio, Webcam & Bluetooth**: Intel cAVS 1.5 DSP (`SND_SOC_INTEL_AVS`, `dsp_driver=4`) + `MAX98373` speakers + `DA7219` headphone jack (`PCM 1`) + `uvcvideo` Duo Cam webcam + Bluetooth A2DP audio enabled
           files: |
             churro-build/project-churro/out/churro-pixelbook-go-atlas.img.gz.part-*
             churro-build/project-churro/out/REASSEMBLE.bat
