@@ -158,11 +158,13 @@ jobs:
           p = "features/audio-generic/churro-mixer.c"
           src = open(p).read()
           new_sw = '''int sw = ((strstr(name, "Playback Switch") || strstr(name, "Speaker Switch") ||
-                     strstr(name, "Spk Switch") || strstr(name, "Headphone Switch") ||
-                     strstr(name, "Sense Switch") || strstr(name, "Enable Switch") ||
+                     strstr(name, "Spk") || strstr(name, "Headphone Switch") ||
+                     strstr(name, "Sense") || strstr(name, "Enable Switch") ||
+                     strstr(name, "DHT") || strstr(name, "BDE") ||
                      strstr(name, "DACL Switch") || strstr(name, "DACR Switch")) &&
                     !strstr(name, "Beep")) || !strcmp(name, "Capture Switch");'''
-          new_vol = '''int vol = !strcmp(name, "Master Playback Volume") ||
+          new_vol = '''int vol = !strcmp(name, "Master Playback Volume") || !strcmp(name, "DSP") ||
+                    strstr(name, "Left Speaker") || strstr(name, "Right Speaker") ||
                     strstr(name, "Digital Volume") || strstr(name, "Speaker Gain") ||
                     strstr(name, "Headphone Volume") || strstr(name, "Capture Volume");'''
           src = re.sub(r'int\s+sw\s*=[^;]+;', new_sw, src, count=1, flags=re.S)
@@ -170,7 +172,7 @@ jobs:
           open(p, "w").write(src)
           PY_MIXER
 
-          # 6. Update features/audio-generic/patch-vendor.sh for AVS PCM 1 configs, i965_drv_video.so camera VA-API symlink, and full Blur effects
+          # 6. Update features/audio-generic/patch-vendor.sh for AVS PCM 1 configs, i965_drv_video.so camera VA-API symlink, and Blur toggle
           python3 - << 'PY_VENDOR'
           import re
           p = "features/audio-generic/patch-vendor.sh"
@@ -181,11 +183,12 @@ jobs:
             setfattr -h -n security.selinux -v u:object_r:same_process_hal_file:s0 "$T/lib64/i965_drv_video.so" 2>/dev/null || true
           fi
           if [ -f "$T/build.prop" ]; then
-            sed -i '/^ro\\.surface_flinger\\.supports_background_blur=/d; /^ro\\.sf\\.blurs_are_expensive=/d; /^ro\\.launcher\\.blur\\.appLaunch=/d; /^persist\\.sys\\.sf\\.disable_blurs=/d' "$T/build.prop"
+            sed -i '/^ro\\.surface_flinger\\.supports_background_blur=/d; /^ro\\.sf\\.blurs_are_expensive=/d; /^ro\\.launcher\\.blur\\.appLaunch=/d; /^persist\\.sys\\.sf\\.disable_blurs=/d; /^persist\\.bluetooth\\.a2dp_offload\\.disabled=/d' "$T/build.prop"
             echo "ro.surface_flinger.supports_background_blur=1" >> "$T/build.prop"
             echo "ro.sf.blurs_are_expensive=0" >> "$T/build.prop"
             echo "ro.launcher.blur.appLaunch=1" >> "$T/build.prop"
             echo "persist.sys.sf.disable_blurs=0" >> "$T/build.prop"
+            echo "persist.bluetooth.a2dp_offload.disabled=false" >> "$T/build.prop"
           fi'''
           src = src.replace('T=$1; A=$T/etc/audio; F=$(dirname "$0"); S=$T/etc/selinux', extra_vendor, 1)
 
@@ -195,77 +198,49 @@ jobs:
           mk avsda7219 "avs_da7219" 0
           mk DA7219 "AVS I2S DA7219" 0
           for avs_d in avsmax98373 MAX98373 avsda7219 DA7219; do
-            sed -i "s|<PlaybackPCM>hw:${W},0</PlaybackPCM>|<PlaybackPCM>hw:${W},1</PlaybackPCM>|g" "$A/$avs_d/audio_config.xml" 2>/dev/null || true
+            if [ -f "$A/$avs_d/audio_config.xml" ]; then
+              setfattr -n security.selinux -v u:object_r:vendor_configs_file:s0 "$A/$avs_d/audio_config.xml" 2>/dev/null || true
+            fi
           done'''
           src = re.sub(r'mk\s+sofhdadsp\s+sof-hda-dsp[^\n]*', avs_cards, src, count=1)
           open(p, "w").write(src)
           PY_VENDOR
 
-          # 7. Inject Pixelbook Go (ATLAS) Display Scaling (1920x1080 @ 160 DPI), Bluetooth A2DP Fix, Webcam/Audio Init, Full Blur & Deep Sleep
-          mkdir -p features/audio-generic/vendor/etc/init features/audio-generic/vendor/bin
-          cat << 'ATLAS_SH' > features/audio-generic/vendor/bin/churro-atlas-init.sh
-          #!/vendor/bin/sh
-          export PATH=/vendor/bin:/system/bin:$PATH
-
-          for mod in system_heap uvcvideo videobuf2_vmalloc videobuf2_v4l2 videobuf2_common \
-                     cros_ec_lpcs cros_ec_dev leds_cros_ec \
-                     snd_soc_avs snd_soc_max98373 snd_soc_max98373_i2c snd_soc_da7219 \
-                     snd_soc_dmic snd_hda_codec_hdmi snd_soc_avs_max98373 \
-                     snd_soc_avs_da7219 snd_soc_avs_dmic snd_soc_avs_hdaudio; do
-              /vendor/bin/modprobe -d /vendor/lib/modules "$mod" 2>/dev/null || modprobe "$mod" 2>/dev/null || true
-          done
-
-          chmod 0666 /dev/dma_heap/* /dev/ashmem /dev/dri/* 2>/dev/null || true
-
-          if [ -w /sys/class/leds/chromeos::kbd_backlight/brightness ]; then
-              chmod 0666 /sys/class/leds/chromeos::kbd_backlight/brightness 2>/dev/null || true
-              echo 40 > /sys/class/leds/chromeos::kbd_backlight/brightness 2>/dev/null || true
-          fi
-          echo "deep" > /sys/power/mem_sleep 2>/dev/null || true
-
-          setprop persist.sys.sf.disable_blurs 0 2>/dev/null || true
-          /system/bin/settings put global disable_window_blurs 0 2>/dev/null || true
-          /system/bin/settings put global accessibility_reduce_transparency 0 2>/dev/null || true
-
-          sleep 2
-          for c in 0 1 2 3 4; do
-              if [ -d "/proc/asound/card${c}" ]; then
-                  /vendor/bin/churro-mixer "$c" 2>/dev/null || true
-              fi
-          done
-          ATLAS_SH
-          sed -i 's/^          //' features/audio-generic/vendor/bin/churro-atlas-init.sh
-          chmod 0755 features/audio-generic/vendor/bin/churro-atlas-init.sh
-
+          # 7. Inject Pixelbook Go (ATLAS) Display Scaling (1920x1080 @ 160 DPI), Bluetooth A2DP Fix, Blur, Deep Sleep & ADB TCP
+          mkdir -p features/audio-generic/vendor/etc/init
           cat << 'ATLAS_RC' > features/audio-generic/vendor/etc/init/init.churro.atlas.rc
           on early-init
               setprop ro.sf.lcd_density 160
               setprop persist.sys.dpi 160
               setprop persist.aicore.enabled false
+
+          on property:sys.boot_completed=1
               setprop persist.bluetooth.a2dp_offload.disabled false
-              setprop ro.surface_flinger.supports_background_blur 1
-              setprop ro.sf.blurs_are_expensive 0
-              setprop ro.launcher.blur.appLaunch 1
               setprop persist.sys.sf.disable_blurs 0
               setprop service.adb.tcp.port 5555
               setprop persist.adb.tcp.port 5555
-
-          on property:sys.boot_completed=1
-              start churro_atlas_init
-
-          service churro_atlas_init /vendor/bin/churro-atlas-init.sh
-              class late_start
-              user root
-              group root audio graphics system
-              oneshot
-              seclabel u:r:vendor_init:s0
+              write /sys/power/mem_sleep deep
+              chmod 0666 /sys/class/leds/chromeos::kbd_backlight/brightness
+              write /sys/class/leds/chromeos::kbd_backlight/brightness 40
+              exec u:r:get_variant_audio:s0 -- /vendor/bin/churro-mixer 0
+              exec u:r:get_variant_audio:s0 -- /vendor/bin/churro-mixer 1
+              exec u:r:get_variant_audio:s0 -- /vendor/bin/churro-mixer 2
           ATLAS_RC
           sed -i 's/^          //' features/audio-generic/vendor/etc/init/init.churro.atlas.rc
 
           # 8. Add AVS dsp_driver=4, S3 deep sleep, and i915 PSR/FBC black-screen fix to /churro/grub.cfg via lib/esp.sh
-          if [ -f "lib/esp.sh" ]; then
-            sed -i 's|churro/kernel \$base|churro/kernel \$base snd_intel_dspcfg.dsp_driver=4 mem_sleep_default=deep i915.enable_psr=0 i915.enable_fbc=0|g' lib/esp.sh || true
-          fi
+          python3 - << 'PY_ESP'
+          import re
+          p = "lib/esp.sh"
+          s = open(p).read()
+          extra = " snd_intel_dspcfg.dsp_driver=4 mem_sleep_default=deep i915.enable_psr=0 i915.enable_fbc=0"
+          def add_args(m):
+              line = m.group(0)
+              return line if "mem_sleep_default=deep" in line else line + extra
+          s_new = re.sub(r'^.*linux\s+.*kernel[^\n]*', add_args, s, flags=re.M)
+          assert s_new != s, "Failed to patch kernel cmdline in lib/esp.sh"
+          open(p, "w").write(s_new)
+          PY_ESP
 
       - name: Download Official Googlebook Recovery Image & Build Project Churro
         env:
@@ -346,11 +321,13 @@ jobs:
           name: "Project Churro for Pixelbook Go (ATLAS) — Build #${{ github.run_number }}"
           body: |
             ### Project Churro (Googlebook OS / Android 17) — Google Pixelbook Go (`ATLAS`)
-            - **Graphics**: Native Mesa Intel Drivers (`iris` / `crocus` / `intel_hasvk` / `Zink`) + Rebuilt `minigbm` Allocator for Intel UHD Graphics 615 (Gen 9.5) + `i965_drv_video.so` VA-API symlink + Full SurfaceFlinger/SystemUI Blur Effects Enabled
+            - **Graphics**: Native Mesa Intel Drivers (`iris` / `crocus` / `intel_hasvk` / `Zink`) + Rebuilt `minigbm` Allocator for Intel UHD Graphics 615 (Gen 9.5) + `i965_drv_video.so` VA-API symlink + SurfaceFlinger Blur
             - **CPU & Crypto**: Recompiled BoringSSL (`libcrypto.so` + `libcrypto_httpengine.so`) for Amber Lake / Haswell+ CPUs + Kernel `vex-emulate` handler
             - **Display & Sleep**: Pre-configured `1920x1080` at `160 DPI`, S3 `deep` sleep (`mem_sleep_default=deep`), and `i915.enable_psr=0 i915.enable_fbc=0` black-screen fix in `/churro/grub.cfg`
             - **Audio, Webcam & Bluetooth**: Intel cAVS 1.5 DSP (`SND_SOC_INTEL_AVS`, `dsp_driver=4`) + `MAX98373` speakers + `DA7219` headphone jack (`PCM 1`) + `uvcvideo` Duo Cam webcam + Bluetooth A2DP audio enabled
           files: |
             churro-build/project-churro/out/churro-pixelbook-go-atlas.img.gz.part-*
             churro-build/project-churro/out/REASSEMBLE.bat
-            churro-
+            churro-build/project-churro/out/reassemble.sh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
