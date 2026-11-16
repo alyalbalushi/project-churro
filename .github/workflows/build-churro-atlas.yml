@@ -63,7 +63,7 @@ jobs:
             curl wget git unzip zip jq python3 python3-pip python3-venv python3-mako python3-yaml python3-ply \
             binutils lz4 zstd xz-utils bzip2 build-essential flex bison bc rsync pkg-config \
             cmake ninja-build meson libssl-dev libelf-dev libdw-dev zlib1g-dev \
-            autoconf automake libtool liblz4-dev uuid-dev libselinux1-dev libsepol-dev checkpolicy default-jre-headless \
+            autoconf automake libtool liblz4-dev uuid-dev libselinux1-dev libsepol-dev checkpolicy secilc default-jre-headless \
             gettext autopoint gperf texinfo kpartx e2fsprogs erofs-utils mtools xorriso pigz attr
 
           # 2. Install exact Mesa 26 host-tools dependencies (from gfx/build-mesa.sh + spirv-tools)
@@ -91,6 +91,7 @@ jobs:
           cd "$WORKDIR"
 
           git clone --depth 1 https://github.com/alesimula/project-churro.git
+          git clone --depth 1 https://github.com/linuxkid473/gbos-x86.git
           git clone --depth 1 https://github.com/WeirdTreeThing/chromebook-linux-audio.git
           git clone --depth 1 https://github.com/WeirdTreeThing/alsa-ucm-conf-cros.git
 
@@ -108,9 +109,12 @@ jobs:
             dpkg-deb -x firmware-intel-sound.deb "$WORKDIR/deb-fw/extracted" || true
             rm -f firmware-intel-sound.deb
           fi
-          mkdir -p "$WORKDIR/deb-fw/extracted/usr/lib/firmware/intel"
-          IPU3_FW="irci_irci_ecr-master_20161208_0213_20170112_1500.bin"
-          curl -fsSL -o "$WORKDIR/deb-fw/extracted/usr/lib/firmware/intel/$IPU3_FW"             "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/main/intel/$IPU3_FW" ||           curl -fsSL -o "$WORKDIR/deb-fw/extracted/usr/lib/firmware/intel/$IPU3_FW"             "https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/intel/$IPU3_FW" || true
+          MISC_DEB_URL="$(curl -fsSL --connect-timeout 10 https://packages.debian.org/sid/all/firmware-intel-misc/download | grep -m1 -oE 'https?://[^"]+/firmware-intel-misc_[^"]+_all\.deb' || true)"
+          if [ -n "$MISC_DEB_URL" ]; then
+            curl -fL --connect-timeout 10 -o firmware-intel-misc.deb "$MISC_DEB_URL" || true
+            dpkg-deb -x firmware-intel-misc.deb "$WORKDIR/deb-fw/extracted" || true
+            rm -f firmware-intel-misc.deb
+          firmware/intel/$IPU3_FW"             "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/main/intel/$IPU3_FW" ||           curl -fsSL -o "$WORKDIR/deb-fw/extracted/usr/lib/firmware/intel/$IPU3_FW"             "https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/intel/$IPU3_FW" || true
           if [ -s "$WORKDIR/deb-fw/extracted/usr/lib/firmware/intel/$IPU3_FW" ]; then
             cp -f "$WORKDIR/deb-fw/extracted/usr/lib/firmware/intel/$IPU3_FW" "$WORKDIR/deb-fw/extracted/usr/lib/firmware/intel/ipu3-fw.bin"
           fi
@@ -125,13 +129,59 @@ jobs:
           # Ensure gfx/build-mesa.sh includes spirv-tools and uses LLVM 18 matching libllvmspirvlib-18-dev
           sed -i 's/libllvmspirvlib-18-dev/libllvmspirvlib-18-dev spirv-tools spirv-headers/' gfx/build-mesa.sh
 
-          # 1. Append Pixelbook Go (ATLAS) UVC Webcam, Audio & EC Modules in kmod/profiles/generic.conf
+          # 1. Append Pixelbook Go (ATLAS) UVC/IPU3 Webcam, Audio, EC Modules & GBOS KernelSU in kmod/profiles/generic.conf
           if [ -f "kmod/profiles/generic.conf" ]; then
             cat << 'KCFG_EOF' >> "kmod/profiles/generic.conf"
+          Y+=" KPROBES KRETPROBES HAVE_SYSCALL_TRACEPOINTS KSU KSU_X86_PATCH_SYSCALL_DISPATCHER"
           M+=" USB_VIDEO_CLASS VIDEO_IMX208 INTEL_SKL_INT3472 IPU_BRIDGE VIDEO_IPU3_CIO2 VIDEO_IPU3_IMGU SND_SOC_INTEL_AVS SND_SOC_INTEL_AVS_MACH_DA7219 SND_SOC_INTEL_AVS_MACH_DMIC SND_SOC_INTEL_AVS_MACH_HDAUDIO SND_SOC_INTEL_AVS_MACH_MAX98373 SND_SOC_INTEL_AVS_MACH_MAX98927 SND_SOC_MAX98373 SND_SOC_MAX98373_I2C SND_SOC_DA7219 MFD_CROS_EC_DEV CROS_EC CROS_EC_LPC LEDS_CROS_EC"
           KCFG_EOF
             sed -i 's/^          //' "kmod/profiles/generic.conf" 2>/dev/null || true
           fi
+
+          # 1b. Integrate KernelSU from gbos-x86 (kernel/kernelsu/apply.sh + CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=y + ksud + manager.apk)
+          if [ -f "$WORKDIR/gbos-x86/kernel/kernelsu/apply.sh" ] && [ -f "kmod/build-kernel.sh" ]; then
+            python3 - "$WORKDIR/gbos-x86/kernel/kernelsu/apply.sh" << 'PY_KSU_HOOK'
+          import re, sys
+          apply_sh = sys.argv[1]
+          p = "kmod/build-kernel.sh"
+          s = open(p).read()
+          hook = f'''
+          # --- Inject GBOS KernelSU into kernel tree before config/make ---
+          for kdir in . "$SRC" "$KSRC" "$KERNEL_DIR" "$1"; do
+            if [ -n "$kdir" ] && [ -d "$kdir/drivers" ] && [ -f "$kdir/Makefile" ] && [ ! -e "$kdir/drivers/kernelsu" ]; then
+              echo "[*] Applying GBOS KernelSU to kernel tree at $kdir..."
+              bash "{apply_sh}" "$kdir" || (cd "$kdir" && bash "{apply_sh}" .) || true
+              for cfg in "$kdir/.config" "$OUT/.config" .config; do
+                if [ -f "$cfg" ]; then
+                  grep -q "CONFIG_KSU=y" "$cfg" || printf "\nCONFIG_KPROBES=y\nCONFIG_KSU=y\nCONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=y\n" >> "$cfg"
+                fi
+              done
+            fi
+          done
+          '''
+          s = re.sub(r'(olddefconfig)', hook + r'\n\1', s, count=1)
+          open(p, "w").write(s)
+          PY_KSU_HOOK
+          fi
+
+          mkdir -p features/audio-generic/vendor/ksu
+          if [ -f "$WORKDIR/gbos-x86/usb/ksu/ksud" ]; then
+            cp -f "$WORKDIR/gbos-x86/usb/ksu/ksud" features/audio-generic/vendor/ksu/ksud
+          fi
+          if [ -f "$WORKDIR/gbos-x86/usb/ksu/manager.apk" ]; then
+            cp -f "$WORKDIR/gbos-x86/usb/ksu/manager.apk" features/audio-generic/vendor/ksu/manager.apk
+          fi
+          if [ ! -s features/audio-generic/vendor/ksu/ksud ] || [ ! -s features/audio-generic/vendor/ksu/manager.apk ]; then
+            KSU_REL_JSON="$(curl -fsSL https://api.github.com/repos/tiann/KernelSU/releases/latest || true)"
+            KSUD_URL="$(grep -oE 'https://github.com/[^"''' ]+x86_64-linux-android-ksud' "$WORKDIR/gbos-x86/build.sh" 2>/dev/null | head -n1 || true)"
+            [ -n "$KSUD_URL" ] || KSUD_URL="$(echo "$KSU_REL_JSON" | jq -r '.assets[] | select(.name | contains("x86_64-linux-android-ksud")) | .browser_download_url' | head -n1 || true)"
+            APK_URL="$(grep -oE 'https://github.com/[^"''' ]+KernelSU[^"''' ]*\.apk' "$WORKDIR/gbos-x86/build.sh" 2>/dev/null | head -n1 || true)"
+            [ -n "$APK_URL" ] || APK_URL="$(echo "$KSU_REL_JSON" | jq -r '.assets[] | select(.name | endswith(".apk")) | .browser_download_url' | head -n1 || true)"
+            [ -n "$KSUD_URL" ] && curl -fL -o features/audio-generic/vendor/ksu/ksud "$KSUD_URL" || true
+            [ -n "$APK_URL" ] && curl -fL -o features/audio-generic/vendor/ksu/manager.apk "$APK_URL" || true
+          fi
+          chmod 0755 features/audio-generic/vendor/ksu/ksud 2>/dev/null || true
+          chmod 0644 features/audio-generic/vendor/ksu/manager.apk 2>/dev/null || true
 
           # 2. Stage Intel cAVS 1.5 Firmware & Topologies into features/firmware-extra/vendor/firmware/intel/avs
           FW_DEST="features/firmware-extra/vendor/firmware/intel/avs"
@@ -147,7 +197,7 @@ jobs:
           if [ -f "$FW_DEST/hda-80862809-tplg.bin" ] && [ ! -f "$FW_DEST/hda-8086280b-tplg.bin" ]; then
             cp -f "$FW_DEST/hda-80862809-tplg.bin" "$FW_DEST/hda-8086280b-tplg.bin"
           fi
-          rm -rf "$WORKDIR/deb-fw" "$WORKDIR/chromebook-linux-audio" "$WORKDIR/alsa-ucm-conf-cros"
+          rm -rf "$WORKDIR/deb-fw" "$WORKDIR/chromebook-linux-audio" "$WORKDIR/alsa-ucm-conf-cros" "$WORKDIR/gbos-x86"
 
           # 3. Update features/audio-generic/patch-vendor_dlkm.sh to force dsp_driver=4 (AVS) and preload uvcvideo + AVS codecs
           cat << 'DLKM_EOF' >> features/audio-generic/patch-vendor_dlkm.sh
@@ -249,8 +299,121 @@ jobs:
             fi
           done'''
           src = re.sub(r'mk\s+sofhdadsp\s+sof-hda-dsp[^\n]*', avs_cards, src, count=1)
+
+          kbd_addon = '''
+          if [ -f "$F/churro-kbd.c" ]; then
+            gcc -O2 -static -o "$T/bin/churro-kbd" "$F/churro-kbd.c"
+            chmod 0755 "$T/bin/churro-kbd"
+            setfattr -n security.selinux -v u:object_r:get_variant_audio_exec:s0 "$T/bin/churro-kbd"
+          fi
+          if [ -f "$S/vendor_sepolicy.cil" ]; then
+            cp -f "$S/vendor_sepolicy.cil" "$S/vendor_sepolicy.cil.bak"
+            cat << 'CIL_EOF' >> "$S/vendor_sepolicy.cil"
+          (allow get_variant_audio input_device (dir (ioctl read getattr lock open watch watch_reads search)))
+          (allow get_variant_audio input_device (chr_file (ioctl read getattr lock open watch watch_reads)))
+          (allow get_variant_audio sysfs (file (ioctl read write getattr lock append map open watch watch_reads)))
+          (allow get_variant_audio sysfs_leds (dir (ioctl read getattr lock open watch watch_reads search)))
+          (allow get_variant_audio sysfs_leds (file (ioctl read write getattr lock append map open watch watch_reads)))
+          (allow get_variant_audio sysfs_leds (lnk_file (ioctl read getattr lock map open watch watch_reads)))
+          CIL_EOF
+            if command -v secilc >/dev/null 2>&1 && [ -f "$T/../system/system/etc/selinux/plat_sepolicy.cil" ]; then
+              secilc -m -M true -G -N -c 30 "$T/../system/system/etc/selinux/plat_sepolicy.cil" "$S/plat_pub_versioned.cil" "$S/vendor_sepolicy.cil" -o /dev/null -f /dev/null || cp -f "$S/vendor_sepolicy.cil.bak" "$S/vendor_sepolicy.cil"
+            fi
+            rm -f "$S/vendor_sepolicy.cil.bak"
+          fi
+          '''
+          src = src + "\n" + kbd_addon
           open(p, "w").write(src)
           PY_VENDOR
+
+          # 6b. Create features/audio-generic/churro-kbd.c (Alt + F6/F7 or Alt + BrightnessDown/Up Keyboard Backlight Daemon)
+          cat << 'KBD_C' > features/audio-generic/churro-kbd.c
+          #include <dirent.h>
+          #include <fcntl.h>
+          #include <linux/input.h>
+          #include <poll.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <unistd.h>
+
+          #define BACKLIGHT_PATH "/sys/class/leds/chromeos::kbd_backlight/brightness"
+          #define MAX_PATH_LEN "/sys/class/leds/chromeos::kbd_backlight/max_brightness"
+
+          static int read_int(const char *path, int def_val) {
+              int fd = open(path, O_RDONLY);
+              if (fd < 0) return def_val;
+              char buf[32] = {0};
+              if (read(fd, buf, sizeof(buf) - 1) <= 0) { close(fd); return def_val; }
+              close(fd);
+              return atoi(buf);
+          }
+
+          static void write_int(const char *path, int val) {
+              int fd = open(path, O_WRONLY);
+              if (fd < 0) return;
+              char buf[32];
+              int n = snprintf(buf, sizeof(buf), "%d\n", val);
+              write(fd, buf, n);
+              close(fd);
+          }
+
+          int main(void) {
+              if (access(BACKLIGHT_PATH, F_OK) != 0) return 0;
+              int max_b = read_int(MAX_PATH_LEN, 100);
+              if (max_b <= 0) max_b = 100;
+              int step = max_b / 5;
+              if (step < 1) step = 1;
+
+              struct pollfd pfds[32];
+              int nfds = 0;
+              DIR *d = opendir("/dev/input");
+              if (!d) return 0;
+              struct dirent *de;
+              while ((de = readdir(d)) != NULL && nfds < 32) {
+                  if (strncmp(de->d_name, "event", 5) == 0) {
+                      char p[64];
+                      snprintf(p, sizeof(p), "/dev/input/%s", de->d_name);
+                      int fd = open(p, O_RDONLY | O_NONBLOCK);
+                      if (fd >= 0) {
+                          pfds[nfds].fd = fd;
+                          pfds[nfds].events = POLLIN;
+                          nfds++;
+                      }
+                  }
+              }
+              closedir(d);
+              if (nfds == 0) return 0;
+
+              int alt_down = 0;
+              while (1) {
+                  if (poll(pfds, nfds, -1) <= 0) continue;
+                  for (int i = 0; i < nfds; i++) {
+                      if (!(pfds[i].revents & POLLIN)) continue;
+                      struct input_event ev;
+                      while (read(pfds[i].fd, &ev, sizeof(ev)) == sizeof(ev)) {
+                          if (ev.type != EV_KEY) continue;
+                          if (ev.code == KEY_LEFTALT || ev.code == KEY_RIGHTALT) {
+                              alt_down = (ev.value != 0);
+                          } else if (alt_down && ev.value == 1) {
+                              int cur = read_int(BACKLIGHT_PATH, 40);
+                              if (ev.code == KEY_F6 || ev.code == KEY_BRIGHTNESSDOWN) {
+                                  cur -= step;
+                                  if (cur < 0) cur = 0;
+                                  write_int(BACKLIGHT_PATH, cur);
+                              } else if (ev.code == KEY_F7 || ev.code == KEY_BRIGHTNESSUP) {
+                                  cur += step;
+                                  if (cur > max_b) cur = max_b;
+                                  write_int(BACKLIGHT_PATH, cur);
+                              }
+                          }
+                      }
+                  }
+              }
+              return 0;
+          }
+          KBD_C
+          sed -i 's/^          //' features/audio-generic/churro-kbd.c
 
           # 7. Inject Pixelbook Go (ATLAS) Display Scaling (1920x1080 @ 160 DPI), Bluetooth A2DP Fix, Blur, Deep Sleep & ADB TCP
           mkdir -p features/audio-generic/vendor/etc/init
@@ -259,6 +422,17 @@ jobs:
               setprop ro.sf.lcd_density 160
               setprop persist.sys.dpi 160
               setprop persist.aicore.enabled false
+
+          on post-fs-data
+              mkdir /data/adb 0700 root root
+              mkdir /data/adb/ksu 0700 root root
+              mkdir /data/adb/ksu/bin 0700 root root
+              copy /vendor/ksu/ksud /data/adb/ksud
+              copy /vendor/ksu/ksud /data/adb/ksu/bin/ksud
+              chmod 0755 /data/adb/ksud
+              chmod 0755 /data/adb/ksu/bin/ksud
+              chown root root /data/adb/ksud
+              chown root root /data/adb/ksu/bin/ksud
 
           on property:sys.boot_completed=1
               setprop persist.bluetooth.a2dp_offload.disabled false
@@ -269,6 +443,17 @@ jobs:
               chmod 0666 /sys/class/leds/chromeos::kbd_backlight/brightness
               write /sys/class/leds/chromeos::kbd_backlight/brightness 40
               exec u:r:get_variant_audio:s0 -- /vendor/bin/sh -c "/vendor/bin/churro-mixer 0; /vendor/bin/churro-mixer 1; /vendor/bin/churro-mixer 2"
+              copy /vendor/ksu/manager.apk /data/local/tmp/ksu-manager.apk
+              chmod 0644 /data/local/tmp/ksu-manager.apk
+              exec - root root -- /system/bin/pm install -r /data/local/tmp/ksu-manager.apk
+              start churro_kbd
+
+          service churro_kbd /vendor/bin/churro-kbd
+              class late_start
+              user root
+              group root input system
+              disabled
+              seclabel u:r:get_variant_audio:s0
           ATLAS_RC
           sed -i 's/^          //' features/audio-generic/vendor/etc/init/init.churro.atlas.rc
 
