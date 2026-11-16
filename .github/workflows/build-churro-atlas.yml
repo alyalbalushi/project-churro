@@ -6,7 +6,7 @@ on:
       build_mode:
         description: 'Build Mode (fast_patch = ~6 min using latest release; full_build = ~30 min from scratch)'
         required: true
-        default: 'fast_patch'
+        default: 'full_build'
         type: choice
         options:
           - 'fast_patch'
@@ -154,12 +154,13 @@ jobs:
           DLKM_EOF
           sed -i 's/^          //' features/audio-generic/patch-vendor_dlkm.sh
 
-          # 4. Update features/audio-generic/get_variant_audio to recognize AVS / MAX98373 / DA7219 cards
+          # 4. Update features/audio-generic/get_variant_audio to recognize AVS / MAX98373 / DA7219 cards and unmute all cards
           python3 - << 'PY_GVA'
+          import re
           p = "features/audio-generic/get_variant_audio"
           src = open(p).read()
           src = src.replace("case $id in sof*)", "case $id in sof*|avs*|MAX98373*|DA7219*)")
-          src = src.replace('/vendor/bin/churro-mixer "$n"', 'for c in /sys/class/sound/card[0-9]*; do /vendor/bin/churro-mixer "${c##*card}" 2>/dev/null || true; done')
+          src = re.sub(r'.*churro-mixer.*', 'for c in /sys/class/sound/card[0-9]*; do /vendor/bin/churro-mixer "${c##*card}" 2>/dev/null || true; done', src)
           open(p, "w").write(src)
           PY_GVA
 
@@ -209,8 +210,18 @@ jobs:
           mk avsda7219 "avs_da7219" 0
           mk DA7219 "AVS I2S DA7219" 0
           for avs_d in avsmax98373 MAX98373 avsda7219 DA7219; do
-            if [ -f "$A/$avs_d/audio_config.xml" ]; then
-              setfattr -n security.selinux -v u:object_r:vendor_configs_file:s0 "$A/$avs_d/audio_config.xml" 2>/dev/null || true
+            CFG="$A/$avs_d/audio_config.xml"
+            if [ -f "$CFG" ]; then
+              python3 - "$CFG" << 'PY_ACFG'
+          import re, sys
+          cp = sys.argv[1]
+          s = open(cp).read()
+          s = re.sub(r'(<InternalMic>.*?)<CapturePCM>[^<]+</CapturePCM>', r'\1<CapturePCM>hw:0,0</CapturePCM>', s, flags=re.S)
+          s = re.sub(r'(<Headphone>.*?)<PlaybackPCM>[^<]+</PlaybackPCM>', r'\1<PlaybackPCM>hw:2,0</PlaybackPCM>', s, flags=re.S)
+          s = re.sub(r'(<Mic>.*?)<CapturePCM>[^<]+</CapturePCM>', r'\1<CapturePCM>hw:2,0</CapturePCM>', s, flags=re.S)
+          open(cp, "w").write(s)
+          PY_ACFG
+              setfattr -n security.selinux -v u:object_r:vendor_configs_file:s0 "$CFG" 2>/dev/null || true
             fi
           done'''
           src = re.sub(r'mk\s+sofhdadsp\s+sof-hda-dsp[^\n]*', avs_cards, src, count=1)
@@ -233,9 +244,7 @@ jobs:
               write /sys/power/mem_sleep deep
               chmod 0666 /sys/class/leds/chromeos::kbd_backlight/brightness
               write /sys/class/leds/chromeos::kbd_backlight/brightness 40
-              exec u:r:get_variant_audio:s0 -- /vendor/bin/churro-mixer 0
-              exec u:r:get_variant_audio:s0 -- /vendor/bin/churro-mixer 1
-              exec u:r:get_variant_audio:s0 -- /vendor/bin/churro-mixer 2
+              exec u:r:get_variant_audio:s0 -- /vendor/bin/sh -c "/vendor/bin/churro-mixer 0; /vendor/bin/churro-mixer 1; /vendor/bin/churro-mixer 2"
           ATLAS_RC
           sed -i 's/^          //' features/audio-generic/vendor/etc/init/init.churro.atlas.rc
 
@@ -493,9 +502,7 @@ jobs:
               write /sys/power/mem_sleep deep
               chmod 0666 /sys/class/leds/chromeos::kbd_backlight/brightness
               write /sys/class/leds/chromeos::kbd_backlight/brightness 40
-              exec u:r:get_variant_audio:s0 -- /vendor/bin/churro-mixer 0
-              exec u:r:get_variant_audio:s0 -- /vendor/bin/churro-mixer 1
-              exec u:r:get_variant_audio:s0 -- /vendor/bin/churro-mixer 2
+              exec u:r:get_variant_audio:s0 -- /vendor/bin/sh -c "/vendor/bin/churro-mixer 0; /vendor/bin/churro-mixer 1; /vendor/bin/churro-mixer 2"
           ATLAS_RC
           sudo sed -i 's/^          //' "$WORKDIR/vendor_dir/etc/init/init.churro.atlas.rc"
           sudo chmod 0644 "$WORKDIR/vendor_dir/etc/init/init.churro.atlas.rc"
