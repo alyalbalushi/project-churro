@@ -108,6 +108,12 @@ jobs:
             dpkg-deb -x firmware-intel-sound.deb "$WORKDIR/deb-fw/extracted" || true
             rm -f firmware-intel-sound.deb
           fi
+          mkdir -p "$WORKDIR/deb-fw/extracted/usr/lib/firmware/intel"
+          IPU3_FW="irci_irci_ecr-master_20161208_0213_20170112_1500.bin"
+          curl -fsSL -o "$WORKDIR/deb-fw/extracted/usr/lib/firmware/intel/$IPU3_FW"             "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/main/intel/$IPU3_FW" ||           curl -fsSL -o "$WORKDIR/deb-fw/extracted/usr/lib/firmware/intel/$IPU3_FW"             "https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/intel/$IPU3_FW" || true
+          if [ -s "$WORKDIR/deb-fw/extracted/usr/lib/firmware/intel/$IPU3_FW" ]; then
+            cp -f "$WORKDIR/deb-fw/extracted/usr/lib/firmware/intel/$IPU3_FW" "$WORKDIR/deb-fw/extracted/usr/lib/firmware/intel/ipu3-fw.bin"
+          fi
 
       - name: Stage Pixelbook Go (ATLAS) Audio, Webcam, Bluetooth, Sleep, Display & 160 DPI Fixes
         if: ${{ inputs.build_mode == 'full_build' }}
@@ -122,7 +128,7 @@ jobs:
           # 1. Append Pixelbook Go (ATLAS) UVC Webcam, Audio & EC Modules in kmod/profiles/generic.conf
           if [ -f "kmod/profiles/generic.conf" ]; then
             cat << 'KCFG_EOF' >> "kmod/profiles/generic.conf"
-          M+=" USB_VIDEO_CLASS SND_SOC_INTEL_AVS SND_SOC_INTEL_AVS_MACH_DA7219 SND_SOC_INTEL_AVS_MACH_DMIC SND_SOC_INTEL_AVS_MACH_HDAUDIO SND_SOC_INTEL_AVS_MACH_MAX98373 SND_SOC_INTEL_AVS_MACH_MAX98927 SND_SOC_MAX98373 SND_SOC_MAX98373_I2C SND_SOC_DA7219 MFD_CROS_EC_DEV CROS_EC CROS_EC_LPC LEDS_CROS_EC"
+          M+=" USB_VIDEO_CLASS VIDEO_IMX208 INTEL_SKL_INT3472 IPU_BRIDGE VIDEO_IPU3_CIO2 VIDEO_IPU3_IMGU SND_SOC_INTEL_AVS SND_SOC_INTEL_AVS_MACH_DA7219 SND_SOC_INTEL_AVS_MACH_DMIC SND_SOC_INTEL_AVS_MACH_HDAUDIO SND_SOC_INTEL_AVS_MACH_MAX98373 SND_SOC_INTEL_AVS_MACH_MAX98927 SND_SOC_MAX98373 SND_SOC_MAX98373_I2C SND_SOC_DA7219 MFD_CROS_EC_DEV CROS_EC CROS_EC_LPC LEDS_CROS_EC"
           KCFG_EOF
             sed -i 's/^          //' "kmod/profiles/generic.conf" 2>/dev/null || true
           fi
@@ -133,6 +139,7 @@ jobs:
           if [ -d "$WORKDIR/deb-fw/extracted/usr/lib/firmware/intel/avs" ]; then
             cp -rf "$WORKDIR/deb-fw/extracted/usr/lib/firmware/intel/avs/"* "$FW_DEST/" 2>/dev/null || true
           fi
+          cp -f "$WORKDIR/deb-fw/extracted/usr/lib/firmware/intel/"*ipu3* "$WORKDIR/deb-fw/extracted/usr/lib/firmware/intel/"*irci* "features/firmware-extra/vendor/firmware/intel/" 2>/dev/null || true
           cp -rf "$WORKDIR/chromebook-linux-audio/blobs/avs/"* "$FW_DEST/" 2>/dev/null || true
           if [ -f "$FW_DEST/skl/dsp_basefw.bin" ] && [ ! -f "$FW_DEST/kbl/dsp_basefw.bin" ]; then
             cp -f "$FW_DEST/skl/dsp_basefw.bin" "$FW_DEST/kbl/dsp_basefw.bin"
@@ -149,7 +156,8 @@ jobs:
             echo "options snd_soc_avs ignore_fw_version=1" >> "$D/modules.options"
           }
           grep -q 'softdep snd_soc_avs' "$D/modules.softdep" 2>/dev/null || {
-            echo "softdep snd_soc_avs pre: uvcvideo videobuf2_vmalloc videobuf2_v4l2 videobuf2_common snd_soc_dmic snd_soc_max98373 snd_soc_max98373_i2c snd_soc_da7219 snd_hda_codec_hdmi snd_soc_avs_dmic snd_soc_avs_max98373 snd_soc_avs_da7219 snd_soc_avs_hdaudio cros_ec_lpcs cros_ec_dev leds_cros_ec" >> "$D/modules.softdep"
+            echo "softdep snd_soc_avs pre: uvcvideo videobuf2_vmalloc videobuf2_v4l2 videobuf2_common intel_skl_int3472_discrete ipu_bridge imx208 ipu3_cio2 ipu3_imgu snd_soc_dmic snd_soc_max98373 snd_soc_max98373_i2c snd_soc_da7219 snd_hda_codec_hdmi snd_soc_avs_dmic snd_soc_avs_max98373 snd_soc_avs_da7219 snd_soc_avs_hdaudio cros_ec_lpcs cros_ec_dev leds_cros_ec" >> "$D/modules.softdep"
+            echo "softdep ipu3_cio2 pre: intel_skl_int3472_discrete ipu_bridge imx208" >> "$D/modules.softdep"
           }
           DLKM_EOF
           sed -i 's/^          //' features/audio-generic/patch-vendor_dlkm.sh
@@ -201,7 +209,23 @@ jobs:
             echo "ro.launcher.blur.appLaunch=1" >> "$T/build.prop"
             echo "persist.sys.sf.disable_blurs=0" >> "$T/build.prop"
             echo "persist.bluetooth.a2dp_offload.disabled=false" >> "$T/build.prop"
-          fi'''
+          fi
+          for ipa_dir in "$T/share/libcamera/ipa/ipu3" "$T/etc/libcamera/ipa/ipu3" "$T/etc/camera/libcamera"; do
+            mkdir -p "$ipa_dir"
+            cat << 'IMX_EOF' > "$ipa_dir/imx208.yaml"
+          %YAML 1.1
+          ---
+          version: 1
+          algorithms:
+            - Agc:
+            - Awb:
+            - BlackLevelCorrection:
+            - ToneMapping:
+          ...
+          IMX_EOF
+            sed -i 's/^          //' "$ipa_dir/imx208.yaml"
+            setfattr -n security.selinux -v u:object_r:vendor_configs_file:s0 "$ipa_dir/imx208.yaml" 2>/dev/null || true
+          done'''
           src = src.replace('T=$1; A=$T/etc/audio; F=$(dirname "$0"); S=$T/etc/selinux', extra_vendor, 1)
 
           avs_cards = '''mk sofhdadsp sof-hda-dsp 6 3 4 5
