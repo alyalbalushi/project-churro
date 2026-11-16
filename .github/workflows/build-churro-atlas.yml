@@ -114,9 +114,6 @@ jobs:
             curl -fL --connect-timeout 10 -o firmware-intel-misc.deb "$MISC_DEB_URL" || true
             dpkg-deb -x firmware-intel-misc.deb "$WORKDIR/deb-fw/extracted" || true
             rm -f firmware-intel-misc.deb
-          firmware/intel/$IPU3_FW"             "https://gitlab.com/kernel-firmware/linux-firmware/-/raw/main/intel/$IPU3_FW" ||           curl -fsSL -o "$WORKDIR/deb-fw/extracted/usr/lib/firmware/intel/$IPU3_FW"             "https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/plain/intel/$IPU3_FW" || true
-          if [ -s "$WORKDIR/deb-fw/extracted/usr/lib/firmware/intel/$IPU3_FW" ]; then
-            cp -f "$WORKDIR/deb-fw/extracted/usr/lib/firmware/intel/$IPU3_FW" "$WORKDIR/deb-fw/extracted/usr/lib/firmware/intel/ipu3-fw.bin"
           fi
 
       - name: Stage Pixelbook Go (ATLAS) Audio, Webcam, Bluetooth, Sleep, Display & 160 DPI Fixes
@@ -172,13 +169,31 @@ jobs:
             cp -f "$WORKDIR/gbos-x86/usb/ksu/manager.apk" features/audio-generic/vendor/ksu/manager.apk
           fi
           if [ ! -s features/audio-generic/vendor/ksu/ksud ] || [ ! -s features/audio-generic/vendor/ksu/manager.apk ]; then
-            KSU_REL_JSON="$(curl -fsSL https://api.github.com/repos/tiann/KernelSU/releases/latest || true)"
-            KSUD_URL="$(grep -oE 'https://github.com/[^"''' ]+x86_64-linux-android-ksud' "$WORKDIR/gbos-x86/build.sh" 2>/dev/null | head -n1 || true)"
-            [ -n "$KSUD_URL" ] || KSUD_URL="$(echo "$KSU_REL_JSON" | jq -r '.assets[] | select(.name | contains("x86_64-linux-android-ksud")) | .browser_download_url' | head -n1 || true)"
-            APK_URL="$(grep -oE 'https://github.com/[^"''' ]+KernelSU[^"''' ]*\.apk' "$WORKDIR/gbos-x86/build.sh" 2>/dev/null | head -n1 || true)"
-            [ -n "$APK_URL" ] || APK_URL="$(echo "$KSU_REL_JSON" | jq -r '.assets[] | select(.name | endswith(".apk")) | .browser_download_url' | head -n1 || true)"
-            [ -n "$KSUD_URL" ] && curl -fL -o features/audio-generic/vendor/ksu/ksud "$KSUD_URL" || true
-            [ -n "$APK_URL" ] && curl -fL -o features/audio-generic/vendor/ksu/manager.apk "$APK_URL" || true
+            python3 - "$WORKDIR/gbos-x86" << 'PY_KSU_DL'
+          import json, os, re, sys, urllib.request
+          gbos_dir = sys.argv[1]
+          ksud_url = apk_url = ""
+          bsh = os.path.join(gbos_dir, "build.sh")
+          if os.path.exists(bsh):
+              txt = open(bsh).read()
+              m1 = re.search(r'https://github\.com/\S+?x86_64-linux-android-ksud', txt)
+              m2 = re.search(r'https://github\.com/\S+?\.apk', txt)
+              if m1: ksud_url = m1.group(0).strip("'\"")
+              if m2: apk_url = m2.group(0).strip("'\"")
+          if not ksud_url or not apk_url:
+              req = urllib.request.Request("https://api.github.com/repos/tiann/KernelSU/releases/latest", headers={"User-Agent": "curl"})
+              rel = json.loads(urllib.request.urlopen(req, timeout=15).read().decode())
+              for a in rel.get("assets", []):
+                  u = a.get("browser_download_url", "")
+                  if "x86_64-linux-android-ksud" in u and not ksud_url:
+                      ksud_url = u
+                  elif u.endswith(".apk") and not apk_url:
+                      apk_url = u
+          if ksud_url and not os.path.exists("features/audio-generic/vendor/ksu/ksud"):
+              urllib.request.urlretrieve(ksud_url, "features/audio-generic/vendor/ksu/ksud")
+          if apk_url and not os.path.exists("features/audio-generic/vendor/ksu/manager.apk"):
+              urllib.request.urlretrieve(apk_url, "features/audio-generic/vendor/ksu/manager.apk")
+          PY_KSU_DL
           fi
           chmod 0755 features/audio-generic/vendor/ksu/ksud 2>/dev/null || true
           chmod 0644 features/audio-generic/vendor/ksu/manager.apk 2>/dev/null || true
