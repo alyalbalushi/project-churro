@@ -135,34 +135,40 @@ jobs:
             sed -i 's/^          //' "kmod/profiles/generic.conf" 2>/dev/null || true
           fi
 
-          # 1b. Integrate KernelSU from gbos-x86 (kernel/kernelsu/apply.sh + CONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=y + ksud + manager.apk)
-          if [ -f "$WORKDIR/gbos-x86/kernel/kernelsu/apply.sh" ] && [ -f "kmod/build-kernel.sh" ]; then
-            python3 - "$WORKDIR/gbos-x86/kernel/kernelsu/apply.sh" << 'PY_KSU_HOOK'
-          import re, sys
+          # 1b. Integrate KernelSU from gbos-x86 & wrap make in kmod/build-kernel.sh so protected_module_names_list and KSU are always applied
+          if [ -d "$WORKDIR/gbos-x86/kernel/kernelsu" ]; then
+            cp -rf "$WORKDIR/gbos-x86/kernel/kernelsu" "$WORKDIR/project-churro/kmod/kernelsu"
+          fi
+          if [ -f "kmod/build-kernel.sh" ]; then
+            python3 - "$WORKDIR/project-churro/kmod/kernelsu/apply.sh" << 'PY_KSU_HOOK'
+          import sys
           apply_sh = sys.argv[1]
           p = "kmod/build-kernel.sh"
-          s = open(p).read()
-          hook = f'''
-          # --- Inject GBOS KernelSU & ensure protected_module_names_list exists ---
-          for kdir in . .. "$SRC" "$KSRC" "$KERNEL_DIR" "$1" /var/cache/churro/src-*/common /var/cache/churro/src-*; do
-            if [ -n "$kdir" ] && [ -d "$kdir" ]; then
-              touch "$kdir/protected_module_names_list" "$kdir/symbol_list" 2>/dev/null || true
-            fi
-            if [ -n "$kdir" ] && [ -d "$kdir/drivers" ] && [ -f "$kdir/Makefile" ] && [ ! -e "$kdir/drivers/kernelsu" ]; then
-              echo "[*] Applying GBOS KernelSU to kernel tree at $kdir..."
-              bash "{apply_sh}" "$kdir" || (cd "$kdir" && bash "{apply_sh}" .) || true
-              touch "$kdir/protected_module_names_list" "$kdir/../protected_module_names_list" 2>/dev/null || true
-              for cfg in "$kdir/.config" "$kdir/out-kernel-generic/.config" "$OUT/.config" .config; do
-                if [ -f "$cfg" ]; then
-                  sed -i 's/"protected_module_names_list"/""/g' "$cfg" 2>/dev/null || true
-                  grep -q "CONFIG_KSU=y" "$cfg" || printf "\nCONFIG_KPROBES=y\nCONFIG_KSU=y\nCONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=y\n" >> "$cfg"
+          lines = open(p).read().splitlines(keepends=True)
+          wrapper = f'''
+          make() {{
+            for kdir in /var/cache/churro/src-*/common /var/cache/churro/src-* . ..; do
+              if [ -d "$kdir" ]; then
+                touch "$kdir/protected_module_names_list" "$kdir/../protected_module_names_list" 2>/dev/null || true
+              fi
+              if [ -d "$kdir/drivers" ] && [ -f "$kdir/Makefile" ] && [ -f "{apply_sh}" ] && [ ! -e "$kdir/drivers/kernelsu" ]; then
+                echo "[*] Applying GBOS KernelSU to kernel tree at $kdir..."
+                bash "{apply_sh}" "$kdir" || (cd "$kdir" && bash "{apply_sh}" .) || true
+              fi
+              for odir in "$kdir"/out-*; do
+                [ -d "$odir" ] && touch "$odir/protected_module_names_list" "$odir/../protected_module_names_list" 2>/dev/null || true
+              done
+              for cfg in "$kdir/.config" "$kdir"/out-*/.config; do
+                if [ -f "$cfg" ] && ! grep -q "CONFIG_KSU=y" "$cfg"; then
+                  printf "\nCONFIG_KPROBES=y\nCONFIG_KSU=y\nCONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=y\n" >> "$cfg"
                 fi
               done
-            fi
-          done
+            done
+            command make "$@"
+          }}
           '''
-          s = re.sub(r'(olddefconfig)', hook + r'\n\1', s)
-          open(p, "w").write(s)
+          lines.insert(1, wrapper + "\n")
+          open(p, "w").write("".join(lines))
           PY_KSU_HOOK
           fi
 
