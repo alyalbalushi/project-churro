@@ -101,6 +101,7 @@ jobs:
         python3 - "$WORKDIR/gbos-x86" << 'PY_KSU_DL'
         import json, os, re, sys, urllib.request
         kp, ap = "features/audio-generic/vendor/ksu/ksud", "features/audio-generic/vendor/ksu/manager.apk"
+        if os.path.exists(kp) and os.path.exists(ap): sys.exit(0)
         ku = au = ""
         bsh = os.path.join(sys.argv[1], "build.sh")
         if os.path.exists(bsh):
@@ -176,7 +177,6 @@ jobs:
             return 0;
         }
         KBD_C
-        sed -i 's/^        //' features/audio-generic/churro-kbd.c
         python3 - << 'PY_PATCHES'
         import re
         p = "features/audio-generic/get_variant_audio"
@@ -192,8 +192,13 @@ jobs:
         open(p, "w").write(s)
         p = "features/audio-generic/patch-vendor.sh"
         s = open(p).read()
-        avs = 'mk sofhdadsp sof-hda-dsp 6 3 4 5\nmk avs_max98373 "avs_max98373" 0\nmk avsmax98373 "avs_max98373" 0\nmk MAX98373 "AVS I2S MAX98373" 0\nmk avsda7219 "avs_da7219" 0\nmk DA7219 "AVS I2S DA7219" 0'
-        s = re.sub(r'mk\s+sofhdadsp\s+sof-hda-dsp[^\n]*', avs, s, count=1)
+        extra_mk = []
+        for card_line in ['mk avsmax98373 "avs_max98373" 0', 'mk MAX98373 "AVS I2S MAX98373" 0', 'mk avsda7219 "avs_da7219" 0', 'mk DA7219 "AVS I2S DA7219" 0']:
+            cname = card_line.split()[1]
+            if f"mk {cname} " not in s:
+                extra_mk.append(card_line)
+        if extra_mk:
+            s = re.sub(r'(mk\s+sofhdadsp\s+sof-hda-dsp[^\n]*)', lambda m: m.group(1) + "\n" + "\n".join(extra_mk), s, count=1)
         open(p, "w").write(s)
         p = "lib/esp.sh"
         s = open(p).read()
@@ -228,7 +233,7 @@ jobs:
         if [ -f "$F/churro-kbd.c" ]; then
           gcc -O2 -static -o "$T/bin/churro-kbd" "$F/churro-kbd.c"
           chmod 0755 "$T/bin/churro-kbd"
-          setfattr -n security.selinux -v u:object_r:get_variant_audio_exec:s0 "$T/bin/churro-kbd"
+          setfattr -n security.selinux -v u:object_r:get_variant_audio_exec:s0 "$T/bin/churro-kbd" 2>/dev/null || true
         fi
         if [ -f "$S/vendor_sepolicy.cil" ]; then
           cat << 'CIL_EOF' >> "$S/vendor_sepolicy.cil"
@@ -243,7 +248,6 @@ jobs:
         CIL_EOF
         fi
         VENDOR_EOF
-        sed -i 's/^        //' features/audio-generic/patch-vendor.sh
         mkdir -p features/audio-generic/vendor/etc/init
         cat << 'ATLAS_RC' > features/audio-generic/vendor/etc/init/init.churro.atlas.rc
         on early-init
@@ -278,46 +282,4 @@ jobs:
             user root
             group root input system
             disabled
-            seclabel u:r:get_variant_audio:s0
-        ATLAS_RC
-        sed -i 's/^        //' features/audio-generic/vendor/etc/init/init.churro.atlas.rc
-    - name: Download Official Googlebook Recovery Image & Build Project Churro
-      env:
-        APPLY_LATEST_OTA: ${{ inputs.apply_latest_ota }}
-        DEBIAN_FRONTEND: noninteractive
-      run: |
-        set -euo pipefail
-        export LLVM_CONFIG=/usr/bin/llvm-config-18
-        WORKDIR="$GITHUB_WORKSPACE/churro-build"
-        cd "$WORKDIR/project-churro"
-        CATALOG_JSON="$(curl -fsSL https://dl.google.com/dl/edgedl/device/recovery/production_recovery.json || true)"
-        REC_URL="$(echo "$CATALOG_JSON" | jq -r '.[] | select(.device=="ruby" or .model=="ruby" or (.url | contains("ruby"))) | .url' | head -n1 || true)"
-        [ -z "$REC_URL" ] || [ "$REC_URL" = "null" ] && REC_URL="https://dl.google.com/device/recovery/ruby-user/16452207/recovery.zip"
-        curl -fL "$REC_URL" -o "$WORKDIR/recovery.zip"
-        unzip -p "$WORKDIR/recovery.zip" > "$WORKDIR/recovery.bin" && rm -f "$WORKDIR/recovery.zip"
-        CURRENT_BIN="$WORKDIR/recovery.bin"
-        if [ "${APPLY_LATEST_OTA}" = "1" ] && [ -x "tools/updater/ota-check.sh" ]; then
-          STEP=1
-          while ./tools/updater/ota-check.sh "$CURRENT_BIN" 2>&1; do
-            NEXT_BIN="$WORKDIR/recovery_ota_${STEP}.bin"
-            ./tools/updater/ota-update.sh "$CURRENT_BIN" --bin "$NEXT_BIN" || break
-            rm -f "$CURRENT_BIN" && CURRENT_BIN="$NEXT_BIN" && STEP=$((STEP + 1))
-          done
-        fi
-        mkdir -p out
-        cp -f features/audio-generic/vendor/ksu/manager.apk out/KernelSU_Manager.apk 2>/dev/null || true
-        yes "" | sudo -E ./churro.sh auto "$CURRENT_BIN" out/churro-pixelbook-go-atlas.img || sudo -E ./churro.sh auto "$CURRENT_BIN" out/churro-pixelbook-go-atlas.img <<< ""
-        rm -f "$CURRENT_BIN" && sudo rm -rf /var/cache/churro 2>/dev/null || true
-        cd out && pigz -p "$(nproc)" -c churro-pixelbook-go-atlas.img | split -b 1900M - churro-pixelbook-go-atlas.img.gz.part-
-        rm -f churro-pixelbook-go-atlas.img && ls -lh churro-pixelbook-go-atlas.img.gz.part-*
-    - name: Upload Flashable Project Churro Image Parts to GitHub Releases
-      uses: softprops/action-gh-release@v2
-      with:
-        tag_name: churro-atlas-${{ github.run_number }}
-        name: "Project Churro for Pixelbook Go (ATLAS) — Build #${{ github.run_number }}"
-        body: "Project Churro (Android 17) for Pixelbook Go (ATLAS) with Audio, Mic, Keyboard Backlight, Blur, Deep Sleep & KernelSU."
-        files: |
-          churro-build/project-churro/out/churro-pixelbook-go-atlas.img.gz.part-*
-          churro-build/project-churro/out/KernelSU_Manager.apk
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
