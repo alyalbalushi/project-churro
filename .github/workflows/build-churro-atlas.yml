@@ -135,7 +135,7 @@ jobs:
             sed -i 's/^          //' "kmod/profiles/generic.conf" 2>/dev/null || true
           fi
 
-          # 1b. Integrate KernelSU from gbos-x86 & wrap make in kmod/build-kernel.sh so protected_module_names_list and KSU are always applied
+          # 1b. Integrate KernelSU from gbos-x86 & wrap make in kmod/build-kernel.sh so KSU + protected_module_names_list are always built
           if [ -d "$WORKDIR/gbos-x86/kernel/kernelsu" ]; then
             cp -rf "$WORKDIR/gbos-x86/kernel/kernelsu" "$WORKDIR/project-churro/kmod/kernelsu"
           fi
@@ -151,18 +151,24 @@ jobs:
               if [ -d "$kdir" ]; then
                 touch "$kdir/protected_module_names_list" "$kdir/../protected_module_names_list" 2>/dev/null || true
               fi
-              if [ -d "$kdir/drivers" ] && [ -f "$kdir/Makefile" ] && [ -f "{apply_sh}" ] && [ ! -e "$kdir/drivers/kernelsu" ]; then
-                echo "[*] Applying GBOS KernelSU to kernel tree at $kdir..."
-                bash "{apply_sh}" "$kdir" || (cd "$kdir" && bash "{apply_sh}" .) || true
-              fi
-              for odir in "$kdir"/out-*; do
-                [ -d "$odir" ] && touch "$odir/protected_module_names_list" "$odir/../protected_module_names_list" 2>/dev/null || true
-              done
-              for cfg in "$kdir/.config" "$kdir"/out-*/.config; do
-                if [ -f "$cfg" ] && ! grep -q "CONFIG_KSU=y" "$cfg"; then
-                  printf "\nCONFIG_KPROBES=y\nCONFIG_KSU=y\nCONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=y\n" >> "$cfg"
+              if [ -d "$kdir/drivers" ] && [ -f "$kdir/Makefile" ] && [ -f "{apply_sh}" ]; then
+                if [ ! -e "$kdir/drivers/kernelsu" ]; then
+                  echo "[*] Applying GBOS KernelSU to kernel tree at $kdir..."
+                  (cd "$kdir" && bash "{apply_sh}" .) || bash "{apply_sh}" "$kdir" || true
                 fi
-              done
+                for odir in "$kdir"/out-* "$kdir"; do
+                  if [ -f "$odir/.config" ]; then
+                    touch "$odir/protected_module_names_list" "$odir/../protected_module_names_list" 2>/dev/null || true
+                    if ! grep -q "^CONFIG_KSU=y" "$odir/.config"; then
+                      if [ -x "$kdir/scripts/config" ]; then
+                        "$kdir/scripts/config" --file "$odir/.config" -e KPROBES -e KRETPROBES -e HAVE_SYSCALL_TRACEPOINTS -e KSU -e KSU_X86_PATCH_SYSCALL_DISPATCHER || true
+                      else
+                        printf "\nCONFIG_KPROBES=y\nCONFIG_KRETPROBES=y\nCONFIG_HAVE_SYSCALL_TRACEPOINTS=y\nCONFIG_KSU=y\nCONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=y\n" >> "$odir/.config"
+                      fi
+                    fi
+                  fi
+                done
+              fi
             done
             command make "$@"
           }}
@@ -268,87 +274,75 @@ jobs:
           open(p, "w").write(src)
           PY_MIXER
 
-          # 6. Update features/audio-generic/patch-vendor.sh for AVS PCM 1 configs, i965_drv_video.so camera VA-API symlink, and Blur toggle
+          # 6. Update features/audio-generic/patch-vendor.sh for AVS PCM configs, SELinux labels, churro-kbd, and Blur toggle
           python3 - << 'PY_VENDOR'
           import re
           p = "features/audio-generic/patch-vendor.sh"
           src = open(p).read()
-          extra_vendor = '''T=$1; A=$T/etc/audio; F=$(dirname "$0"); S=$T/etc/selinux
+
+          avs_cards = '''mk sofhdadsp sof-hda-dsp 6 3 4 5
+          mk avs_max98373 "avs_max98373" 0
+          mk avsmax98373 "avs_max98373" 0
+          mk MAX98373 "AVS I2S MAX98373" 0
+          mk avsda7219 "avs_da7219" 0
+          mk DA7219 "AVS I2S DA7219" 0'''
+          src = re.sub(r'mk\s+sofhdadsp\s+sof-hda-dsp[^\n]*', avs_cards, src, count=1)
+
+          footer_addon = '''
+          # --- Pixelbook Go (ATLAS) Post-Processing (runs after Churro's own mk/SELinux loop) ---
           if [ -f "$T/lib64/iHD_drv_video.so" ] && [ ! -e "$T/lib64/i965_drv_video.so" ]; then
             ln -sfn iHD_drv_video.so "$T/lib64/i965_drv_video.so"
             setfattr -h -n security.selinux -v u:object_r:same_process_hal_file:s0 "$T/lib64/i965_drv_video.so" 2>/dev/null || true
           fi
           if [ -f "$T/build.prop" ]; then
-            sed -i '/^ro\\.surface_flinger\\.supports_background_blur=/d; /^ro\\.sf\\.blurs_are_expensive=/d; /^ro\\.launcher\\.blur\\.appLaunch=/d; /^persist\\.sys\\.sf\\.disable_blurs=/d; /^persist\\.bluetooth\\.a2dp_offload\\.disabled=/d' "$T/build.prop"
+            BP_CTX="$(getfattr -n security.selinux --only-values "$T/build.prop" 2>/dev/null || echo 'u:object_r:vendor_file:s0')"
+            sed -i '/^ro\.surface_flinger\.supports_background_blur=/d; /^ro\.sf\.blurs_are_expensive=/d; /^ro\.launcher\.blur\.appLaunch=/d; /^persist\.sys\.sf\.disable_blurs=/d; /^persist\.bluetooth\.a2dp_offload\.disabled=/d' "$T/build.prop"
             echo "ro.surface_flinger.supports_background_blur=1" >> "$T/build.prop"
             echo "ro.sf.blurs_are_expensive=0" >> "$T/build.prop"
             echo "ro.launcher.blur.appLaunch=1" >> "$T/build.prop"
             echo "persist.sys.sf.disable_blurs=0" >> "$T/build.prop"
             echo "persist.bluetooth.a2dp_offload.disabled=false" >> "$T/build.prop"
+            setfattr -n security.selinux -v "$BP_CTX" "$T/build.prop" 2>/dev/null || true
           fi
-          for ipa_dir in "$T/share/libcamera/ipa/ipu3" "$T/etc/libcamera/ipa/ipu3" "$T/etc/camera/libcamera"; do
-            mkdir -p "$ipa_dir"
-            cat << 'IMX_EOF' > "$ipa_dir/imx208.yaml"
-          %YAML 1.1
-          ---
-          version: 1
-          algorithms:
-            - Agc:
-            - Awb:
-            - BlackLevelCorrection:
-            - ToneMapping:
-          ...
-          IMX_EOF
-            sed -i 's/^          //' "$ipa_dir/imx208.yaml"
-            setfattr -n security.selinux -v u:object_r:vendor_configs_file:s0 "$ipa_dir/imx208.yaml" 2>/dev/null || true
-          done'''
-          src = src.replace('T=$1; A=$T/etc/audio; F=$(dirname "$0"); S=$T/etc/selinux', extra_vendor, 1)
 
-          avs_cards = '''mk sofhdadsp sof-hda-dsp 6 3 4 5
-          mk avsmax98373 "avs_max98373" 0
-          mk MAX98373 "AVS I2S MAX98373" 0
-          mk avsda7219 "avs_da7219" 0
-          mk DA7219 "AVS I2S DA7219" 0
-          for avs_d in avsmax98373 MAX98373 avsda7219 DA7219; do
-            CFG="$A/$avs_d/audio_config.xml"
-            if [ -f "$CFG" ]; then
-              python3 - "$CFG" << 'PY_ACFG'
-          import re, sys
-          cp = sys.argv[1]
-          s = open(cp).read()
-          s = re.sub(r'(<InternalMic>.*?)<CapturePCM>[^<]+</CapturePCM>', r'\1<CapturePCM>hw:0,0</CapturePCM>', s, flags=re.S)
-          s = re.sub(r'(<Headphone>.*?)<PlaybackPCM>[^<]+</PlaybackPCM>', r'\1<PlaybackPCM>hw:2,0</PlaybackPCM>', s, flags=re.S)
-          s = re.sub(r'(<Mic>.*?)<CapturePCM>[^<]+</CapturePCM>', r'\1<CapturePCM>hw:2,0</CapturePCM>', s, flags=re.S)
-          open(cp, "w").write(s)
-          PY_ACFG
-              setfattr -n security.selinux -v u:object_r:vendor_configs_file:s0 "$CFG" 2>/dev/null || true
-            fi
-          done'''
-          src = re.sub(r'mk\s+sofhdadsp\s+sof-hda-dsp[^\n]*', avs_cards, src, count=1)
+          # Route Speaker -> hw:sofrt5682,0 (card1 MAX98373), InternalMic -> hw:0,0 (card0 DMIC), Headphone/Mic -> hw:2,0 (card2 DA7219)
+          python3 - "$A" << 'PY_FIX_XML'
+          import glob, os, re, sys
+          audio_root = sys.argv[1]
+          for d in ["sof-rt5682_alc5682ivs_tas2563", "avs_max98373", "avsmax98373", "MAX98373", "avsda7219", "DA7219"]:
+              cp = os.path.join(audio_root, d, "audio_config.xml")
+              if not os.path.isfile(cp):
+                  continue
+              s = open(cp).read()
+              s = re.sub(r'(<Speaker>\s*<PlaybackPCM>)[^<]+(</PlaybackPCM>)', lambda m: m.group(1) + "hw:sofrt5682,0" + m.group(2), s, flags=re.S)
+              s = re.sub(r'(<InternalMic>\s*<CapturePCM>)[^<]+(</CapturePCM>)', lambda m: m.group(1) + "hw:0,0" + m.group(2), s, flags=re.S)
+              s = re.sub(r'(<Headphone>\s*<PlaybackPCM>)[^<]+(</PlaybackPCM>)', lambda m: m.group(1) + "hw:2,0" + m.group(2), s, flags=re.S)
+              s = re.sub(r'(<Mic>\s*<CapturePCM>)[^<]+(</CapturePCM>)', lambda m: m.group(1) + "hw:2,0" + m.group(2), s, flags=re.S)
+              open(cp, "w").write(s)
+          PY_FIX_XML
 
-          kbd_addon = '''
+          # Ensure EVERY directory and file in /vendor/etc/audio, /vendor/etc/init, and /vendor/ksu has u:object_r:vendor_configs_file:s0
+          find "$A" "$T/etc/init" "$T/ksu" -exec setfattr -h -n security.selinux -v u:object_r:vendor_configs_file:s0 {} + 2>/dev/null || true
+
           if [ -f "$F/churro-kbd.c" ]; then
             gcc -O2 -static -o "$T/bin/churro-kbd" "$F/churro-kbd.c"
             chmod 0755 "$T/bin/churro-kbd"
             setfattr -n security.selinux -v u:object_r:get_variant_audio_exec:s0 "$T/bin/churro-kbd"
           fi
           if [ -f "$S/vendor_sepolicy.cil" ]; then
-            cp -f "$S/vendor_sepolicy.cil" "$S/vendor_sepolicy.cil.bak"
             cat << 'CIL_EOF' >> "$S/vendor_sepolicy.cil"
           (allow get_variant_audio input_device (dir (ioctl read getattr lock open watch watch_reads search)))
           (allow get_variant_audio input_device (chr_file (ioctl read getattr lock open watch watch_reads)))
+          (allow get_variant_audio sysfs (dir (ioctl read getattr lock open watch watch_reads search)))
           (allow get_variant_audio sysfs (file (ioctl read write getattr lock append map open watch watch_reads)))
+          (allow get_variant_audio sysfs (lnk_file (ioctl read getattr lock map open watch watch_reads)))
           (allow get_variant_audio sysfs_leds (dir (ioctl read getattr lock open watch watch_reads search)))
           (allow get_variant_audio sysfs_leds (file (ioctl read write getattr lock append map open watch watch_reads)))
           (allow get_variant_audio sysfs_leds (lnk_file (ioctl read getattr lock map open watch watch_reads)))
           CIL_EOF
-            if command -v secilc >/dev/null 2>&1 && [ -f "$T/../system/system/etc/selinux/plat_sepolicy.cil" ]; then
-              secilc -m -M true -G -N -c 30 "$T/../system/system/etc/selinux/plat_sepolicy.cil" "$S/plat_pub_versioned.cil" "$S/vendor_sepolicy.cil" -o /dev/null -f /dev/null || cp -f "$S/vendor_sepolicy.cil.bak" "$S/vendor_sepolicy.cil"
-            fi
-            rm -f "$S/vendor_sepolicy.cil.bak"
           fi
           '''
-          src = src + "\n" + kbd_addon
+          src = src + "\n" + footer_addon
           open(p, "w").write(src)
           PY_VENDOR
 
@@ -411,23 +405,33 @@ jobs:
               closedir(d);
               if (nfds == 0) return 0;
 
-              int alt_down = 0;
+              int mod_down = 0;
               while (1) {
                   if (poll(pfds, nfds, -1) <= 0) continue;
                   for (int i = 0; i < nfds; i++) {
+                      if (pfds[i].fd < 0) continue;
+                      if (pfds[i].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+                          close(pfds[i].fd);
+                          pfds[i].fd = -1;
+                          continue;
+                      }
                       if (!(pfds[i].revents & POLLIN)) continue;
                       struct input_event ev;
-                      while (read(pfds[i].fd, &ev, sizeof(ev)) == sizeof(ev)) {
+                      ssize_t r;
+                      while ((r = read(pfds[i].fd, &ev, sizeof(ev))) == sizeof(ev)) {
                           if (ev.type != EV_KEY) continue;
-                          if (ev.code == KEY_LEFTALT || ev.code == KEY_RIGHTALT) {
-                              alt_down = (ev.value != 0);
-                          } else if (alt_down && ev.value == 1) {
+                          if (ev.code == KEY_LEFTALT || ev.code == KEY_RIGHTALT ||
+                              ev.code == KEY_LEFTMETA || ev.code == KEY_RIGHTMETA) {
+                              mod_down = (ev.value != 0);
+                          } else if (ev.value == 1 || ev.value == 2) {
                               int cur = read_int(BACKLIGHT_PATH, 40);
-                              if (ev.code == KEY_F6 || ev.code == KEY_BRIGHTNESSDOWN) {
+                              if (ev.code == KEY_KBDILLUMDOWN ||
+                                  (mod_down && (ev.code == KEY_F6 || ev.code == KEY_BRIGHTNESSDOWN))) {
                                   cur -= step;
                                   if (cur < 0) cur = 0;
                                   write_int(BACKLIGHT_PATH, cur);
-                              } else if (ev.code == KEY_F7 || ev.code == KEY_BRIGHTNESSUP) {
+                              } else if (ev.code == KEY_KBDILLUMUP ||
+                                         (mod_down && (ev.code == KEY_F7 || ev.code == KEY_BRIGHTNESSUP))) {
                                   cur += step;
                                   if (cur > max_b) cur = max_b;
                                   write_int(BACKLIGHT_PATH, cur);
@@ -539,6 +543,7 @@ jobs:
           chmod +x "$CHURRO_EXEC"
 
           mkdir -p out
+          cp -f features/audio-generic/vendor/ksu/manager.apk out/KernelSU_Manager.apk 2>/dev/null || true
           yes "" | sudo -E "$CHURRO_EXEC" auto "$CURRENT_BIN" out/churro-pixelbook-go-atlas.img || \
             sudo -E "$CHURRO_EXEC" auto "$CURRENT_BIN" out/churro-pixelbook-go-atlas.img <<< ""
           rm -f "$CURRENT_BIN"
@@ -788,6 +793,7 @@ jobs:
             - **Audio, Webcam & Bluetooth**: Intel cAVS 1.5 DSP (`SND_SOC_INTEL_AVS`, `dsp_driver=4`) + `MAX98373` speakers + `DA7219` headphone jack (`PCM 1`) + `uvcvideo` Duo Cam webcam + Bluetooth A2DP audio enabled
           files: |
             churro-build/project-churro/out/churro-pixelbook-go-atlas.img.gz.part-*
+            churro-build/project-churro/out/KernelSU_Manager.apk
             churro-build/project-churro/out/REASSEMBLE.bat
             churro-build/project-churro/out/reassemble.sh
         env:
