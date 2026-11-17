@@ -152,9 +152,20 @@ jobs:
                 touch "$kdir/protected_module_names_list" "$kdir/../protected_module_names_list" 2>/dev/null || true
               fi
               if [ -d "$kdir/drivers" ] && [ -f "$kdir/Makefile" ] && [ -f "{apply_sh}" ]; then
-                if [ ! -e "$kdir/drivers/kernelsu" ]; then
+                if [ ! -f "$kdir/drivers/kernelsu/Kconfig" ]; then
                   echo "[*] Applying GBOS KernelSU to kernel tree at $kdir..."
-                  (cd "$kdir" && bash "{apply_sh}" .) || bash "{apply_sh}" "$kdir" || true
+                  bash "{apply_sh}" "$kdir" || (cd "$kdir" && bash "{apply_sh}" .) || true
+                  KSU_DIR="$(dirname "{apply_sh}")"
+                  if [ ! -f "$kdir/drivers/kernelsu/Kconfig" ]; then
+                    mkdir -p "$kdir/drivers/kernelsu"
+                    if [ -d "$KSU_DIR/kernel" ]; then
+                      cp -rf "$KSU_DIR/kernel/"* "$kdir/drivers/kernelsu/"
+                    else
+                      cp -rf "$KSU_DIR/"* "$kdir/drivers/kernelsu/" 2>/dev/null || true
+                    fi
+                  fi
+                  grep -q "kernelsu" "$kdir/drivers/Makefile" || echo 'obj-$(CONFIG_KSU) += kernelsu/' >> "$kdir/drivers/Makefile"
+                  grep -q "drivers/kernelsu/Kconfig" "$kdir/drivers/Kconfig" || sed -i '/^endmenu/i source "drivers/kernelsu/Kconfig"' "$kdir/drivers/Kconfig"
                 fi
                 for odir in "$kdir"/out-* "$kdir"; do
                   if [ -f "$odir/.config" ]; then
@@ -322,7 +333,7 @@ jobs:
           PY_FIX_XML
 
           # Ensure EVERY directory and file in /vendor/etc/audio, /vendor/etc/init, and /vendor/ksu has u:object_r:vendor_configs_file:s0
-          find "$A" "$T/etc/init" "$T/ksu" -exec setfattr -h -n security.selinux -v u:object_r:vendor_configs_file:s0 {} + 2>/dev/null || true
+          find "$A" "$T/etc/init" "$T/ksu" -exec setfattr -h -n security.selinux -v u:object_r:vendor_configs_file:s0 {} \; 2>/dev/null || true
 
           if [ -f "$F/churro-kbd.c" ]; then
             gcc -O2 -static -o "$T/bin/churro-kbd" "$F/churro-kbd.c"
