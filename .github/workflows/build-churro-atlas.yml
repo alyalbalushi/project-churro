@@ -260,4 +260,4 @@ jobs:
             cb/project-churro/out/churro-pixelbook-go-atlas.img.gz.part-*
             cb/project-churro/out/KernelSU_Manager.apk
         env:
-          GITHUB_TOK
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
