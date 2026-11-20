@@ -43,6 +43,9 @@ jobs:
           sudo rm -rf /build/inputs/KernelSU
           sudo mkdir -p /build/inputs
           sudo git clone https://github.com/tiann/KernelSU.git /build/inputs/KernelSU
+          if [ -f /build/inputs/KernelSU/kernel/Kbuild ]; then
+            echo 'ccflags-y += -I/build/inputs/KernelSU -I/build/inputs/KernelSU/kernel -I/build/inputs/KernelSU/kernel/include' | sudo tee -a /build/inputs/KernelSU/kernel/Kbuild >/dev/null
+          fi
           sudo chmod -R a+rX /build/inputs/KernelSU
           chmod +x "$W/project-churro/churro.sh" "$W/project-churro/"*/*.sh 2>/dev/null || true
           cd "$W/deb-fw"
