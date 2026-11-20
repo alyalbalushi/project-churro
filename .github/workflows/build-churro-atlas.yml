@@ -58,7 +58,6 @@ jobs:
           FAG="features/audio-generic"
           sed -i 's/libllvmspirvlib-18-dev/libllvmspirvlib-18-dev spirv-tools spirv-headers/' gfx/build-mesa.sh
           printf 'Y+=" KPROBES KRETPROBES HAVE_SYSCALL_TRACEPOINTS OVERLAY_FS KSU KSU_X86_PATCH_SYSCALL_DISPATCHER"\nM+=" USB_VIDEO_CLASS VIDEO_IMX208 INTEL_SKL_INT3472 IPU_BRIDGE VIDEO_IPU3_CIO2 VIDEO_IPU3_IMGU SND_SOC_INTEL_AVS SND_SOC_INTEL_AVS_MACH_DA7219 SND_SOC_INTEL_AVS_MACH_DMIC SND_SOC_INTEL_AVS_MACH_HDAUDIO SND_SOC_INTEL_AVS_MACH_MAX98373 SND_SOC_INTEL_AVS_MACH_MAX98927 SND_SOC_MAX98373 SND_SOC_MAX98373_I2C SND_SOC_DA7219 MFD_CROS_EC_DEV CROS_EC CROS_EC_LPC LEDS_CROS_EC"\n' >> kmod/profiles/generic.conf
-          cp -rf "$W/gbos-x86/kernel/kernelsu" "$W/project-churro/kmod/kernelsu"
           head -n 1 kmod/build-kernel.sh > kmod/bk.new
           cat << KW >> kmod/bk.new
           make() {
@@ -69,10 +68,12 @@ jobs:
               [ -d "\$d" ] && touch "\$d/protected_module_names_list" "\$d/../protected_module_names_list" 2>/dev/null || true
               if [ -d "\$d/drivers" ] && [ -f "\$d/Makefile" ]; then
                 SRC="\$(cd "\$d" && pwd)"
-                if [ ! -f "\$SRC/drivers/kernelsu/Kconfig" ] && [ -f "$W/project-churro/kmod/kernelsu/apply.sh" ]; then
+                if [ ! -f "\$SRC/drivers/kernelsu/Kconfig" ]; then
                   rm -rf "\$SRC/drivers/kernelsu"
-                  mkdir -p /build && ln -sfn "\$SRC" /build/src
-                  bash "$W/project-churro/kmod/kernelsu/apply.sh" "\$SRC"
+                  ln -sfn /build/inputs/KernelSU/kernel "\$SRC/drivers/kernelsu"
+                  grep -q "kernelsu" "\$SRC/drivers/Makefile" || echo 'obj-\$(CONFIG_KSU) += kernelsu/' >> "\$SRC/drivers/Makefile"
+                  grep -q 'drivers/kernelsu/Kconfig' "\$SRC/drivers/Kconfig" || sed -i '\$i source "drivers/kernelsu/Kconfig"' "\$SRC/drivers/Kconfig"
+                  echo ">> KernelSU linked into \$SRC/drivers/kernelsu"
                 fi
                 break
               fi
