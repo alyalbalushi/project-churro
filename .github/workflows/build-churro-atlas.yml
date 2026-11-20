@@ -43,8 +43,10 @@ jobs:
           sudo rm -rf /build/inputs/KernelSU
           sudo mkdir -p /build/inputs
           sudo git clone https://github.com/tiann/KernelSU.git /build/inputs/KernelSU
+          KSU_REF="$(grep -oE '[0-9a-f]{40}|v[0-9]+\.[0-9]+\.[0-9]+' "$W/gbos-x86/kernel/fetch_kernel_sources.sh" 2>/dev/null | head -n1 || true)"
+          [ -n "$KSU_REF" ] && sudo git -C /build/inputs/KernelSU checkout "$KSU_REF" 2>/dev/null || true
           if [ -d /build/inputs/KernelSU/uapi ]; then
-            sudo ln -sfn /build/inputs/KernelSU/uapi /build/inputs/KernelSU/kernel/uapi
+            sudo cp -rf /build/inputs/KernelSU/uapi /build/inputs/KernelSU/kernel/uapi
           fi
           if [ -f /build/inputs/KernelSU/kernel/Kbuild ]; then
             printf '\nccflags-y += -I/build/inputs/KernelSU -I/build/inputs/KernelSU/kernel -I/build/inputs/KernelSU/kernel/include\n' | sudo tee -a /build/inputs/KernelSU/kernel/Kbuild >/dev/null
@@ -76,11 +78,11 @@ jobs:
                 SRC="\$(cd "\$d" && pwd)"
                 if [ ! -f "\$SRC/drivers/kernelsu/Kconfig" ]; then
                   rm -rf "\$SRC/drivers/kernelsu"
-                  ln -sfn /build/inputs/KernelSU/kernel "\$SRC/drivers/kernelsu"
-                  [ -d /build/inputs/KernelSU/uapi ] && ln -sfn /build/inputs/KernelSU/uapi "\$SRC/drivers/uapi"
+                  cp -rf /build/inputs/KernelSU/kernel "\$SRC/drivers/kernelsu"
+                  [ -d /build/inputs/KernelSU/uapi ] && cp -rf /build/inputs/KernelSU/uapi "\$SRC/drivers/uapi"
                   grep -q "kernelsu" "\$SRC/drivers/Makefile" || echo 'obj-\$(CONFIG_KSU) += kernelsu/' >> "\$SRC/drivers/Makefile"
                   grep -q 'drivers/kernelsu/Kconfig' "\$SRC/drivers/Kconfig" || sed -i '\$i source "drivers/kernelsu/Kconfig"' "\$SRC/drivers/Kconfig"
-                  echo ">> KernelSU linked into \$SRC/drivers/kernelsu"
+                  echo ">> KernelSU copied into \$SRC/drivers/kernelsu"
                 fi
                 break
               fi
@@ -98,11 +100,25 @@ jobs:
                 echo ">> KernelSU config enabled in \$cf"
               fi
             done
-            if ! command make "\$@"; then
-              echo "=== KERNELSU BUILD ERROR DETAILS ===" >&2
-              command make "\$@" -j1 drivers/kernelsu/ 2>&1 | tail -n 60 | sed 's/^/KSU_ERR: /' >&2 || true
-              return 1
-            fi
+            case " \$* " in
+              *config*|*clean*|*release*|*install*|*M=*|*headers*) ;;
+              *)
+                if [ ! -f /tmp/.ksu_checked ] && [ -n "\$SRC" ] && [ -f "\$SRC/drivers/kernelsu/Kconfig" ]; then
+                  touch /tmp/.ksu_checked
+                  MARGS=(); PREV=""
+                  for a in "\$@"; do
+                    if [ -n "\$PREV" ]; then MARGS+=("\$a"); PREV=""; continue; fi
+                    case "\$a" in -C|-f|-j|-I|-l) MARGS+=("\$a"); PREV=1 ;; *=*|-*) MARGS+=("\$a") ;; esac
+                  done
+                  if ! command make "\${MARGS[@]}" prepare >/tmp/ksu_prep.log 2>&1 || ! command make "\${MARGS[@]}" -j1 drivers/kernelsu/ >/tmp/ksu_build.log 2>&1; then
+                    tail -n 60 /tmp/ksu_prep.log /tmp/ksu_build.log 2>/dev/null | sed 's/^/ERROR_KSU: /' >&2
+                    return 1
+                  fi
+                  echo ">> ERROR_KSU: drivers/kernelsu compiled OK!" >&2
+                fi
+              ;;
+            esac
+            command make "\$@"
             case " \$* " in *" bzImage "*|*" vmlinux "*|*" all "*)
               if ! grep -rq "^CONFIG_KSU=y" "\$PWD/.config" "\$ODIR/.config" /var/cache/churro/*/.config /var/cache/churro/*/*/.config 2>/dev/null; then
                 echo "FATAL: CONFIG_KSU=y missing after kernel build!" >&2
