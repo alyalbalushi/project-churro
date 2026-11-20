@@ -53,36 +53,45 @@ jobs:
           cd "$W/project-churro"
           FAG="features/audio-generic"
           sed -i 's/libllvmspirvlib-18-dev/libllvmspirvlib-18-dev spirv-tools spirv-headers/' gfx/build-mesa.sh
-          printf 'Y+=" KPROBES KRETPROBES HAVE_SYSCALL_TRACEPOINTS KSU KSU_X86_PATCH_SYSCALL_DISPATCHER"\nM+=" USB_VIDEO_CLASS VIDEO_IMX208 INTEL_SKL_INT3472 IPU_BRIDGE VIDEO_IPU3_CIO2 VIDEO_IPU3_IMGU SND_SOC_INTEL_AVS SND_SOC_INTEL_AVS_MACH_DA7219 SND_SOC_INTEL_AVS_MACH_DMIC SND_SOC_INTEL_AVS_MACH_HDAUDIO SND_SOC_INTEL_AVS_MACH_MAX98373 SND_SOC_INTEL_AVS_MACH_MAX98927 SND_SOC_MAX98373 SND_SOC_MAX98373_I2C SND_SOC_DA7219 MFD_CROS_EC_DEV CROS_EC CROS_EC_LPC LEDS_CROS_EC"\n' >> kmod/profiles/generic.conf
+          printf 'Y+=" KPROBES KRETPROBES HAVE_SYSCALL_TRACEPOINTS OVERLAY_FS KSU KSU_X86_PATCH_SYSCALL_DISPATCHER"\nM+=" USB_VIDEO_CLASS VIDEO_IMX208 INTEL_SKL_INT3472 IPU_BRIDGE VIDEO_IPU3_CIO2 VIDEO_IPU3_IMGU SND_SOC_INTEL_AVS SND_SOC_INTEL_AVS_MACH_DA7219 SND_SOC_INTEL_AVS_MACH_DMIC SND_SOC_INTEL_AVS_MACH_HDAUDIO SND_SOC_INTEL_AVS_MACH_MAX98373 SND_SOC_INTEL_AVS_MACH_MAX98927 SND_SOC_MAX98373 SND_SOC_MAX98373_I2C SND_SOC_DA7219 MFD_CROS_EC_DEV CROS_EC CROS_EC_LPC LEDS_CROS_EC"\n' >> kmod/profiles/generic.conf
           cp -rf "$W/gbos-x86/kernel/kernelsu" "$W/project-churro/kmod/kernelsu"
           head -n 1 kmod/build-kernel.sh > kmod/bk.new
           cat << KW >> kmod/bk.new
           make() {
             ODIR=""
             for a in "\$@"; do case "\$a" in O=*) ODIR="\${a#O=}" ;; esac; done
+            SRC=""
             for d in /var/cache/churro/src-*/common /var/cache/churro/src-* . ..; do
               [ -d "\$d" ] && touch "\$d/protected_module_names_list" "\$d/../protected_module_names_list" 2>/dev/null || true
-              if [ -d "\$d/drivers" ] && [ -f "\$d/Makefile" ] && [ -f "$W/project-churro/kmod/kernelsu/apply.sh" ]; then
-                A="\$(cd "\$d" && pwd)"
-                if [ ! -f "\$A/drivers/kernelsu/Kconfig" ]; then
-                  mkdir -p /build && ln -sfn "\$A" /build/src
-                  bash "$W/project-churro/kmod/kernelsu/apply.sh" "\$A" || true
+              if [ -d "\$d/drivers" ] && [ -f "\$d/Makefile" ]; then
+                SRC="\$(cd "\$d" && pwd)"
+                if [ ! -f "\$SRC/drivers/kernelsu/Kconfig" ] && [ -f "$W/project-churro/kmod/kernelsu/apply.sh" ]; then
+                  mkdir -p /build && ln -sfn "\$SRC" /build/src
+                  bash "$W/project-churro/kmod/kernelsu/apply.sh" "\$SRC"
                 fi
-                for o in "\$ODIR" "\$d"/out-* /var/cache/churro/kbuild-* /var/cache/churro/out-* "\$d"; do
-                  [ -n "\$o" ] && [ -f "\$o/.config" ] || continue
-                  touch "\$o/protected_module_names_list" "\$o/../protected_module_names_list" 2>/dev/null || true
-                  if ! grep -q "^CONFIG_KSU=y" "\$o/.config"; then
-                    if [ -x "\$A/scripts/config" ]; then
-                      "\$A/scripts/config" --file "\$o/.config" -e KPROBES -e KRETPROBES -e HAVE_SYSCALL_TRACEPOINTS -e KSU -e KSU_X86_PATCH_SYSCALL_DISPATCHER || true
-                    else
-                      printf "\nCONFIG_KPROBES=y\nCONFIG_KRETPROBES=y\nCONFIG_HAVE_SYSCALL_TRACEPOINTS=y\nCONFIG_KSU=y\nCONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=y\n" >> "\$o/.config"
-                    fi
-                    echo ">> KernelSU config enabled in \$o/.config"
-                  fi
-                done
+                break
+              fi
+            done
+            for cf in "\$PWD/.config" "\$ODIR/.config" \$(find /var/cache/churro -maxdepth 4 -name .config 2>/dev/null); do
+              [ -f "\$cf" ] || continue
+              o="\$(dirname "\$cf")"
+              touch "\$o/protected_module_names_list" "\$o/../protected_module_names_list" 2>/dev/null || true
+              if [ -n "\$SRC" ] && [ -f "\$SRC/drivers/kernelsu/Kconfig" ] && ! grep -q "^CONFIG_KSU=y" "\$cf"; then
+                if [ -x "\$SRC/scripts/config" ]; then
+                  "\$SRC/scripts/config" --file "\$cf" -e KPROBES -e KRETPROBES -e HAVE_SYSCALL_TRACEPOINTS -e OVERLAY_FS -e KSU -e KSU_X86_PATCH_SYSCALL_DISPATCHER
+                else
+                  printf "\nCONFIG_KPROBES=y\nCONFIG_KRETPROBES=y\nCONFIG_HAVE_SYSCALL_TRACEPOINTS=y\nCONFIG_OVERLAY_FS=y\nCONFIG_KSU=y\nCONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=y\n" >> "\$cf"
+                fi
+                echo ">> KernelSU config enabled in \$cf"
               fi
             done
             command make "\$@"
+            case " \$* " in *" bzImage "*|*" vmlinux "*|*" all "*)
+              if ! grep -rq "^CONFIG_KSU=y" "\$PWD/.config" "\$ODIR/.config" /var/cache/churro/*/.config /var/cache/churro/*/*/.config 2>/dev/null; then
+                echo "FATAL: CONFIG_KSU=y missing after kernel build!" >&2
+                exit 1
+              fi
+            ;; esac
           }
           KW
           tail -n +2 kmod/build-kernel.sh >> kmod/bk.new && mv -f kmod/bk.new kmod/build-kernel.sh && chmod +x kmod/build-kernel.sh
@@ -175,10 +184,10 @@ jobs:
           cat << 'ATLAS_XML' > /tmp/atlas_audio_config.xml
           <?xml version="1.0" encoding="utf-8"?>
           <audio_config>
-                  <SoundCardName>hw:sofrt5682</SoundCardName>
+                  <SoundCardName>hw:1</SoundCardName>
                   <HiFi>
                           <Speaker>
-                                  <PlaybackPCM>hw:sofrt5682,1</PlaybackPCM>
+                                  <PlaybackPCM>hw:1,1</PlaybackPCM>
                                   <DSPLatency>0</DSPLatency>
                           </Speaker>
                           <InternalMic>
@@ -202,28 +211,29 @@ jobs:
                                   <DSPLatency>0</DSPLatency>
                           </Mic>
                           <HDMI1>
-                                  <PlaybackPCM>hw:hdaudioB0D2,1</PlaybackPCM>
+                                  <PlaybackPCM>hw:3,1</PlaybackPCM>
                                   <JackDev>hdaudioB0D2 HDMI/DP,pcm=1</JackDev>
                                   <PlaybackChannels>2</PlaybackChannels>
                           </HDMI1>
                           <HDMI2>
-                                  <PlaybackPCM>hw:hdaudioB0D2,2</PlaybackPCM>
+                                  <PlaybackPCM>hw:3,2</PlaybackPCM>
                                   <JackDev>hdaudioB0D2 HDMI/DP,pcm=2</JackDev>
                                   <PlaybackChannels>2</PlaybackChannels>
                           </HDMI2>
                           <HDMI3>
-                                  <PlaybackPCM>hw:hdaudioB0D2,3</PlaybackPCM>
+                                  <PlaybackPCM>hw:3,3</PlaybackPCM>
                                   <JackDev>hdaudioB0D2 HDMI/DP,pcm=3</JackDev>
                                   <PlaybackChannels>2</PlaybackChannels>
                           </HDMI3>
                   </HiFi>
           </audio_config>
           ATLAS_XML
-          for d in "$A"/avs* "$A"/MAX98373* "$A"/DA7219*; do
+          for d in "$A"/sof-rt5682* "$A"/avs* "$A"/MAX98373* "$A"/DA7219*; do
             [ -d "$d" ] && cp -f /tmp/atlas_audio_config.xml "$d/audio_config.xml"
           done
           rm -f /tmp/atlas_audio_config.xml
           find "$A" "$T/etc/init" "$T/ksu" -exec setfattr -h -n security.selinux -v u:object_r:vendor_configs_file:s0 {} \; 2>/dev/null || true
+          [ -f "$T/bin/churro-mixer" ] && setfattr -n security.selinux -v u:object_r:get_variant_audio_exec:s0 "$T/bin/churro-mixer" 2>/dev/null || true
           if [ -f "$F/churro-kbd.c" ]; then
             gcc -O2 -static -o "$T/bin/churro-kbd" "$F/churro-kbd.c" && chmod 0755 "$T/bin/churro-kbd" && setfattr -n security.selinux -v u:object_r:get_variant_audio_exec:s0 "$T/bin/churro-kbd" 2>/dev/null || true
           fi
@@ -255,7 +265,9 @@ jobs:
               write /sys/power/mem_sleep deep
               chmod 0666 /sys/class/leds/chromeos::kbd_backlight/brightness
               write /sys/class/leds/chromeos::kbd_backlight/brightness 40
-              exec u:r:get_variant_audio:s0 -- /vendor/bin/sh -c "/vendor/bin/churro-mixer 0; /vendor/bin/churro-mixer 1; /vendor/bin/churro-mixer 2"
+              exec u:r:get_variant_audio:s0 -- /vendor/bin/churro-mixer 0
+              exec u:r:get_variant_audio:s0 -- /vendor/bin/churro-mixer 1
+              exec u:r:get_variant_audio:s0 -- /vendor/bin/churro-mixer 2
               copy /vendor/ksu/manager.apk /data/local/tmp/ksu-manager.apk
               chmod 0644 /data/local/tmp/ksu-manager.apk
               exec - root root -- /system/bin/pm install -r /data/local/tmp/ksu-manager.apk
