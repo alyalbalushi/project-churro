@@ -40,6 +40,8 @@ jobs:
           W="$GITHUB_WORKSPACE/cb"
           mkdir -p "$W/deb-fw" && cd "$W"
           for r in alesimula/project-churro linuxkid473/gbos-x86 WeirdTreeThing/chromebook-linux-audio WeirdTreeThing/alsa-ucm-conf-cros; do git clone --depth 1 "https://github.com/$r.git"; done
+          git clone https://github.com/tiann/KernelSU.git "$W/KernelSU"
+          sudo mkdir -p /build/inputs && sudo ln -sfn "$W/KernelSU" /build/inputs/KernelSU
           chmod +x "$W/project-churro/churro.sh" "$W/project-churro/"*/*.sh 2>/dev/null || true
           cd "$W/deb-fw"
           for p in firmware-intel-sound firmware-intel-misc; do
@@ -66,7 +68,7 @@ jobs:
               if [ -d "\$d/drivers" ] && [ -f "\$d/Makefile" ]; then
                 SRC="\$(cd "\$d" && pwd)"
                 if [ ! -f "\$SRC/drivers/kernelsu/Kconfig" ] && [ -f "$W/project-churro/kmod/kernelsu/apply.sh" ]; then
-                  mkdir -p /build && ln -sfn "\$SRC" /build/src
+                  mkdir -p /build/inputs && ln -sfn "\$SRC" /build/src && ln -sfn "$W/KernelSU" /build/inputs/KernelSU
                   bash "$W/project-churro/kmod/kernelsu/apply.sh" "\$SRC"
                 fi
                 break
