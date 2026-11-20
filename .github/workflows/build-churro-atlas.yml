@@ -43,8 +43,11 @@ jobs:
           sudo rm -rf /build/inputs/KernelSU
           sudo mkdir -p /build/inputs
           sudo git clone https://github.com/tiann/KernelSU.git /build/inputs/KernelSU
+          if [ -d /build/inputs/KernelSU/uapi ]; then
+            sudo ln -sfn /build/inputs/KernelSU/uapi /build/inputs/KernelSU/kernel/uapi
+          fi
           if [ -f /build/inputs/KernelSU/kernel/Kbuild ]; then
-            echo 'ccflags-y += -I/build/inputs/KernelSU -I/build/inputs/KernelSU/kernel -I/build/inputs/KernelSU/kernel/include' | sudo tee -a /build/inputs/KernelSU/kernel/Kbuild >/dev/null
+            printf '\nccflags-y += -I/build/inputs/KernelSU -I/build/inputs/KernelSU/kernel -I/build/inputs/KernelSU/kernel/include\n' | sudo tee -a /build/inputs/KernelSU/kernel/Kbuild >/dev/null
           fi
           sudo chmod -R a+rX /build/inputs/KernelSU
           chmod +x "$W/project-churro/churro.sh" "$W/project-churro/"*/*.sh 2>/dev/null || true
@@ -74,6 +77,7 @@ jobs:
                 if [ ! -f "\$SRC/drivers/kernelsu/Kconfig" ]; then
                   rm -rf "\$SRC/drivers/kernelsu"
                   ln -sfn /build/inputs/KernelSU/kernel "\$SRC/drivers/kernelsu"
+                  [ -d /build/inputs/KernelSU/uapi ] && ln -sfn /build/inputs/KernelSU/uapi "\$SRC/drivers/uapi"
                   grep -q "kernelsu" "\$SRC/drivers/Makefile" || echo 'obj-\$(CONFIG_KSU) += kernelsu/' >> "\$SRC/drivers/Makefile"
                   grep -q 'drivers/kernelsu/Kconfig' "\$SRC/drivers/Kconfig" || sed -i '\$i source "drivers/kernelsu/Kconfig"' "\$SRC/drivers/Kconfig"
                   echo ">> KernelSU linked into \$SRC/drivers/kernelsu"
@@ -94,7 +98,11 @@ jobs:
                 echo ">> KernelSU config enabled in \$cf"
               fi
             done
-            command make "\$@"
+            if ! command make "\$@"; then
+              echo "=== KERNELSU BUILD ERROR DETAILS ===" >&2
+              command make "\$@" -j1 drivers/kernelsu/ 2>&1 | tail -n 60 | sed 's/^/KSU_ERR: /' >&2 || true
+              return 1
+            fi
             case " \$* " in *" bzImage "*|*" vmlinux "*|*" all "*)
               if ! grep -rq "^CONFIG_KSU=y" "\$PWD/.config" "\$ODIR/.config" /var/cache/churro/*/.config /var/cache/churro/*/*/.config 2>/dev/null; then
                 echo "FATAL: CONFIG_KSU=y missing after kernel build!" >&2
@@ -314,7 +322,7 @@ jobs:
           mkdir -p out
           cp -f features/audio-generic/vendor/ksu/manager.apk out/KernelSU_Manager.apk 2>/dev/null || true
           IMG="churro-pixelbook-go-atlas.img"
-          yes "" | sudo -E ./churro.sh auto "$BIN" "out/$IMG" || sudo -E ./churro.sh auto "$BIN" "out/$IMG" <<< ""
+          sudo -E ./churro.sh auto "$BIN" "out/$IMG" <<< ""
           rm -f "$BIN" && sudo rm -rf /var/cache/churro 2>/dev/null || true
           cd out && pigz -p "$(nproc)" -c "$IMG" | split -b 1900M - "$IMG.gz.part-" && rm -f "$IMG" && ls -lh "$IMG.gz.part-"*
       - name: Upload Release
