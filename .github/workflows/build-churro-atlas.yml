@@ -58,19 +58,26 @@ jobs:
           head -n 1 kmod/build-kernel.sh > kmod/bk.new
           cat << KW >> kmod/bk.new
           make() {
+            ODIR=""
+            for a in "\$@"; do case "\$a" in O=*) ODIR="\${a#O=}" ;; esac; done
             for d in /var/cache/churro/src-*/common /var/cache/churro/src-* . ..; do
               [ -d "\$d" ] && touch "\$d/protected_module_names_list" "\$d/../protected_module_names_list" 2>/dev/null || true
               if [ -d "\$d/drivers" ] && [ -f "\$d/Makefile" ] && [ -f "$W/project-churro/kmod/kernelsu/apply.sh" ]; then
-                if [ ! -f "\$d/drivers/kernelsu/Kconfig" ]; then
-                  A="\$(cd "\$d" && pwd)"; mkdir -p /build && ln -sfn "\$A" /build/src; bash "$W/project-churro/kmod/kernelsu/apply.sh" "\$A" || true
+                A="\$(cd "\$d" && pwd)"
+                if [ ! -f "\$A/drivers/kernelsu/Kconfig" ]; then
+                  mkdir -p /build && ln -sfn "\$A" /build/src
+                  bash "$W/project-churro/kmod/kernelsu/apply.sh" "\$A" || true
                 fi
-                for o in "\$d"/out-* "\$d"; do
-                  if [ -f "\$o/.config" ]; then
-                    touch "\$o/protected_module_names_list" "\$o/../protected_module_names_list" 2>/dev/null || true
-                    if ! grep -q "^CONFIG_KSU=y" "\$o/.config"; then
-                      if [ -x "\$d/scripts/config" ]; then "\$d/scripts/config" --file "\$o/.config" -e KPROBES -e KRETPROBES -e HAVE_SYSCALL_TRACEPOINTS -e KSU -e KSU_X86_PATCH_SYSCALL_DISPATCHER || true
-                      else printf "\nCONFIG_KPROBES=y\nCONFIG_KRETPROBES=y\nCONFIG_HAVE_SYSCALL_TRACEPOINTS=y\nCONFIG_KSU=y\nCONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=y\n" >> "\$o/.config"; fi
+                for o in "\$ODIR" "\$d"/out-* /var/cache/churro/kbuild-* /var/cache/churro/out-* "\$d"; do
+                  [ -n "\$o" ] && [ -f "\$o/.config" ] || continue
+                  touch "\$o/protected_module_names_list" "\$o/../protected_module_names_list" 2>/dev/null || true
+                  if ! grep -q "^CONFIG_KSU=y" "\$o/.config"; then
+                    if [ -x "\$A/scripts/config" ]; then
+                      "\$A/scripts/config" --file "\$o/.config" -e KPROBES -e KRETPROBES -e HAVE_SYSCALL_TRACEPOINTS -e KSU -e KSU_X86_PATCH_SYSCALL_DISPATCHER || true
+                    else
+                      printf "\nCONFIG_KPROBES=y\nCONFIG_KRETPROBES=y\nCONFIG_HAVE_SYSCALL_TRACEPOINTS=y\nCONFIG_KSU=y\nCONFIG_KSU_X86_PATCH_SYSCALL_DISPATCHER=y\n" >> "\$o/.config"
                     fi
+                    echo ">> KernelSU config enabled in \$o/.config"
                   fi
                 done
               fi
@@ -139,8 +146,8 @@ jobs:
           open(p, "w").write(s)
           p = "features/audio-generic/churro-mixer.c"
           s = open(p).read()
-          sw = 'int sw = ((strstr(name, "Playback Switch") || strstr(name, "Speaker Switch") || strstr(name, "Spk") || strstr(name, "Headphone Switch") || strstr(name, "Sense") || strstr(name, "Enable Switch") || strstr(name, "DHT") || strstr(name, "BDE") || strstr(name, "DACL Switch") || strstr(name, "DACR Switch")) && !strstr(name, "Beep")) || !strcmp(name, "Capture Switch");'
-          vol = 'int vol = !strcmp(name, "Master Playback Volume") || !strcmp(name, "DSP") || strstr(name, "Left Speaker") || strstr(name, "Right Speaker") || strstr(name, "Digital Volume") || strstr(name, "Speaker Gain") || strstr(name, "Headphone Volume") || strstr(name, "Capture Volume");'
+          sw = 'int sw = ((strstr(name, "Playback Switch") || strstr(name, "Speaker Switch") || strstr(name, "Spk") || strstr(name, "Headphone Switch") || strstr(name, "Sense") || strstr(name, "Enable Switch") || strstr(name, "DHT") || strstr(name, "BDE") || strstr(name, "DACL Switch") || strstr(name, "DACR Switch") || strstr(name, "Capture Switch") || strstr(name, "DMIC")) && !strstr(name, "Beep"));'
+          vol = 'int vol = !strcmp(name, "Master Playback Volume") || !strcmp(name, "DSP") || strstr(name, "Left Speaker") || strstr(name, "Right Speaker") || strstr(name, "Digital Volume") || strstr(name, "Speaker Gain") || strstr(name, "Headphone Volume") || strstr(name, "Capture Volume") || strstr(name, "Mic Volume") || strstr(name, "DMIC");'
           s = re.sub(r'int\s+sw\s*=[^;]+;', sw, s, count=1, flags=re.S)
           s = re.sub(r'int\s+vol\s*=[^;]+;', vol, s, count=1, flags=re.S)
           open(p, "w").write(s)
@@ -165,18 +172,57 @@ jobs:
             printf "ro.surface_flinger.supports_background_blur=1\nro.sf.blurs_are_expensive=0\nro.launcher.blur.appLaunch=1\npersist.sys.sf.disable_blurs=0\npersist.bluetooth.a2dp_offload.disabled=false\n" >> "$T/build.prop"
             setfattr -n security.selinux -v "$BP_CTX" "$T/build.prop" 2>/dev/null || true
           fi
-          python3 - "$A" << 'PY_XML'
-          import os, re, sys
-          for d in os.listdir(sys.argv[1]):
-              cp = os.path.join(sys.argv[1], d, "audio_config.xml")
-              if os.path.isfile(cp) and any(k in d for k in ["sof-rt5682", "avs", "MAX98373", "DA7219"]):
-                  s = open(cp).read()
-                  s = re.sub(r'(<Speaker>\s*<PlaybackPCM>)[^<]+(</PlaybackPCM>)', lambda m: m.group(1) + "hw:sofrt5682,0" + m.group(2), s, flags=re.S)
-                  s = re.sub(r'(<InternalMic>\s*<CapturePCM>)[^<]+(</CapturePCM>)', lambda m: m.group(1) + "hw:0,0" + m.group(2), s, flags=re.S)
-                  s = re.sub(r'(<Headphone>\s*<PlaybackPCM>)[^<]+(</PlaybackPCM>)', lambda m: m.group(1) + "hw:2,0" + m.group(2), s, flags=re.S)
-                  s = re.sub(r'(<Mic>\s*<CapturePCM>)[^<]+(</CapturePCM>)', lambda m: m.group(1) + "hw:2,0" + m.group(2), s, flags=re.S)
-                  open(cp, "w").write(s)
-          PY_XML
+          cat << 'ATLAS_XML' > /tmp/atlas_audio_config.xml
+          <?xml version="1.0" encoding="utf-8"?>
+          <audio_config>
+                  <SoundCardName>hw:sofrt5682</SoundCardName>
+                  <HiFi>
+                          <Speaker>
+                                  <PlaybackPCM>hw:sofrt5682,1</PlaybackPCM>
+                                  <DSPLatency>0</DSPLatency>
+                          </Speaker>
+                          <InternalMic>
+                                  <CapturePCM>hw:0,2</CapturePCM>
+                                  <CaptureChannelMap>
+                                          <FL>0</FL>
+                                          <FR>1</FR>
+                                  </CaptureChannelMap>
+                                  <IntrinsicSensitivity>-2600</IntrinsicSensitivity>
+                                  <DSPLatency>0</DSPLatency>
+                          </InternalMic>
+                          <Headphone>
+                                  <PlaybackPCM>hw:2,1</PlaybackPCM>
+                                  <JackDev>avs_da7219 Headphone</JackDev>
+                                  <JackSwitch>2</JackSwitch>
+                                  <DSPLatency>0</DSPLatency>
+                          </Headphone>
+                          <Mic>
+                                  <CapturePCM>hw:2,1</CapturePCM>
+                                  <JackDev>avs_da7219 Mic</JackDev>
+                                  <DSPLatency>0</DSPLatency>
+                          </Mic>
+                          <HDMI1>
+                                  <PlaybackPCM>hw:hdaudioB0D2,1</PlaybackPCM>
+                                  <JackDev>hdaudioB0D2 HDMI/DP,pcm=1</JackDev>
+                                  <PlaybackChannels>2</PlaybackChannels>
+                          </HDMI1>
+                          <HDMI2>
+                                  <PlaybackPCM>hw:hdaudioB0D2,2</PlaybackPCM>
+                                  <JackDev>hdaudioB0D2 HDMI/DP,pcm=2</JackDev>
+                                  <PlaybackChannels>2</PlaybackChannels>
+                          </HDMI2>
+                          <HDMI3>
+                                  <PlaybackPCM>hw:hdaudioB0D2,3</PlaybackPCM>
+                                  <JackDev>hdaudioB0D2 HDMI/DP,pcm=3</JackDev>
+                                  <PlaybackChannels>2</PlaybackChannels>
+                          </HDMI3>
+                  </HiFi>
+          </audio_config>
+          ATLAS_XML
+          for d in "$A"/avs* "$A"/MAX98373* "$A"/DA7219*; do
+            [ -d "$d" ] && cp -f /tmp/atlas_audio_config.xml "$d/audio_config.xml"
+          done
+          rm -f /tmp/atlas_audio_config.xml
           find "$A" "$T/etc/init" "$T/ksu" -exec setfattr -h -n security.selinux -v u:object_r:vendor_configs_file:s0 {} \; 2>/dev/null || true
           if [ -f "$F/churro-kbd.c" ]; then
             gcc -O2 -static -o "$T/bin/churro-kbd" "$F/churro-kbd.c" && chmod 0755 "$T/bin/churro-kbd" && setfattr -n security.selinux -v u:object_r:get_variant_audio_exec:s0 "$T/bin/churro-kbd" 2>/dev/null || true
