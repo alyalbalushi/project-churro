@@ -20,7 +20,6 @@ jobs:
           mkdir -p "$W/src" "$W/out" "$W/clang" "$W/vcam"
           BID="16302624"
           REL="6.18.21-android17-5-g3938c8d97142-ab16302624"
-          CI="https://ci.android.com/builds/submitted/$BID/kernel_x86_64/latest/raw"
 
           echo ">> Checking Project Churro for exact Android Clang 22 URL..."
           git clone --depth 1 https://github.com/alesimula/project-churro.git "$W/churro"
@@ -463,23 +462,25 @@ jobs:
             -e MODVERSIONS \
             -e MEDIA_SUPPORT \
             -e VIDEO_DEV \
-            -m VIDEOBUF2_V4L2 \
-            -m VIDEOBUF2_VMALLOC
+            -e VIDEOBUF2_V4L2 \
+            -e VIDEOBUF2_VMALLOC
           make ARCH=x86_64 LLVM=1 LLVM_IAS=1 O="$W/out" olddefconfig
 
-          echo ">> Verifying struct module + kCFI config flags:"
+          echo ">> Verifying struct module + kCFI + VB2 config flags:"
           grep -E '^(CONFIG_MODULE_SIG|CONFIG_DEBUG_INFO_BTF|CONFIG_CFI|CONFIG_LTO|CONFIG_KPROBES|CONFIG_MODVERSIONS|CONFIG_VIDEOBUF2)' "$W/out/.config" | sort
           grep -q '^CONFIG_CFI_ICALL_NORMALIZE_INTEGERS=y$' "$W/out/.config" || { echo "FATAL: CONFIG_CFI_ICALL_NORMALIZE_INTEGERS not enabled!"; exit 1; }
 
           echo ">> Running prepare (-j1)..."
           make ARCH=x86_64 LLVM=1 LLVM_IAS=1 O="$W/out" -j1 prepare
 
-          echo ">> Building vmlinux + videobuf2 modules for exact Module.symvers..."
+          echo ">> Building vmlinux with built-in videobuf2 for exact vmlinux.symvers..."
           make ARCH=x86_64 LLVM=1 LLVM_IAS=1 O="$W/out" -j"$(nproc)" vmlinux
-          make ARCH=x86_64 LLVM=1 LLVM_IAS=1 O="$W/out" M=drivers/media/common/videobuf2 -j"$(nproc)" modules || true
+          cp -f "$W/out/vmlinux.symvers" "$W/out/Module.symvers"
+          ls -lh "$W/out/Module.symvers"
+          grep -q "vb2_queue_init" "$W/out/Module.symvers"
 
           echo ">> Compiling atlas_vcam.ko..."
-          make ARCH=x86_64 LLVM=1 LLVM_IAS=1 O="$W/out" M="$W/vcam" KBUILD_MODPOST_WARN=1 -j"$(nproc)" modules
+          make ARCH=x86_64 LLVM=1 LLVM_IAS=1 O="$W/out" M="$W/vcam" -j"$(nproc)" modules
 
           mkdir -p "$GITHUB_WORKSPACE/release"
           cp "$W/vcam/atlas_vcam.ko" "$GITHUB_WORKSPACE/release/atlas_vcam.ko"
