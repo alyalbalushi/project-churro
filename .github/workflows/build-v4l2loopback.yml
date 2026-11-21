@@ -17,10 +17,37 @@ jobs:
         run: |
           set -euo pipefail
           W="$GITHUB_WORKSPACE/v4l2build"
-          mkdir -p "$W/src" "$W/out"
+          mkdir -p "$W/src" "$W/out" "$W/clang"
           BID="16302624"
           REL="6.18.21-android17-5-g3938c8d97142-ab16302624"
           CI="https://ci.android.com/builds/submitted/$BID/kernel_x86_64/latest/raw"
+
+          echo ">> Checking Project Churro for exact Android Clang 22 URL..."
+          git clone --depth 1 https://github.com/alesimula/project-churro.git "$W/churro"
+          CLANG_URL="$(python3 - "$W/churro" << 'PY'
+          import os, re, sys
+          root = sys.argv[1]
+          for rel in ["versions.env", "kmod/build-kernel.sh"]:
+              p = os.path.join(root, rel)
+              if not os.path.exists(p): continue
+              s = open(p).read()
+              m = re.search(r'https://[^\s"\']*clang-r[0-9a-zA-Z._-]+[^\s"\']*\.tar\.(?:gz|xz|zst)', s)
+              if m:
+                  print(m.group(0))
+                  sys.exit(0)
+          PY
+          )"
+          if [ -n "$CLANG_URL" ]; then
+            echo ">> Downloading Project Churro Clang: $CLANG_URL"
+            if curl -fsSL "$CLANG_URL" -o "$W/clang.tar"; then
+              tar -xf "$W/clang.tar" -C "$W/clang"
+              CLANG_BIN="$(find "$W/clang" -maxdepth 4 -type f -name clang -printf '%h\n' | head -n 1 || true)"
+              if [ -n "$CLANG_BIN" ]; then
+                export PATH="$CLANG_BIN:$PATH"
+                echo ">> Using Android Clang from $CLANG_BIN"
+              fi
+            fi
+          fi
 
           echo ">> Toolchain versions:"
           clang --version | head -n 1
@@ -50,7 +77,7 @@ jobs:
           print(">> Patched V4L2_PIX_FMT_MJPEG depth 32 -> 16")
           PY
 
-          echo ">> Configuring GKI 6.18.21 (matching running atlas kernel struct module layout)..."
+          echo ">> Configuring GKI 6.18.21 (matching running atlas kernel + kCFI integer normalization)..."
           cd "$W/src"
           touch protected_module_names_list "$W/out/protected_module_names_list"
           make ARCH=x86_64 LLVM=1 LLVM_IAS=1 O="$W/out" gki_defconfig
@@ -64,6 +91,7 @@ jobs:
             -e LTO_NONE \
             -e CFI_CLANG \
             -e CFI \
+            -e CFI_ICALL_NORMALIZE_INTEGERS \
             -e DEBUG_INFO_DWARF5 \
             -e DEBUG_INFO_BTF \
             -e DEBUG_INFO_BTF_MODULES \
@@ -81,8 +109,9 @@ jobs:
             -e VIDEO_DEV
           make ARCH=x86_64 LLVM=1 LLVM_IAS=1 O="$W/out" olddefconfig
 
-          echo ">> Verifying struct module config flags:"
+          echo ">> Verifying struct module + kCFI config flags:"
           grep -E '^(CONFIG_MODULE_SIG|CONFIG_DEBUG_INFO_BTF|CONFIG_CFI|CONFIG_LTO|CONFIG_KPROBES|CONFIG_MODVERSIONS)' "$W/out/.config" | sort
+          grep -q '^CONFIG_CFI_ICALL_NORMALIZE_INTEGERS=y$' "$W/out/.config" || { echo "FATAL: CONFIG_CFI_ICALL_NORMALIZE_INTEGERS not enabled!"; exit 1; }
 
           echo ">> Running prepare (-j1)..."
           make ARCH=x86_64 LLVM=1 LLVM_IAS=1 O="$W/out" -j1 prepare
@@ -109,7 +138,7 @@ jobs:
         with:
           tag_name: v4l2loopback-atlas-${{ github.run_number }}
           name: "v4l2loopback.ko for Pixelbook Go (ATLAS) — Build #${{ github.run_number }}"
-          body: "MJPEG-patched v4l2loopback.ko for Project Churro GKI 6.18.21-android17-5-g3938c8d97142-ab16302624 (BTF + MODULE_SIG + CFI + KPROBES matched)."
+          body: "MJPEG-patched v4l2loopback.ko for Project Churro GKI 6.18.21-android17-5-g3938c8d97142-ab16302624 (kCFI normalize-integers + BTF + MODULE_SIG + KPROBES matched)."
           files: |
             release/v4l2loopback.ko
         env:
