@@ -53,6 +53,10 @@ jobs:
           ./scripts/config --file "$W/out/.config" \
             --set-str LOCALVERSION "-android17-5-g3938c8d97142-ab16302624" \
             -d LOCALVERSION_AUTO \
+            -d RUST \
+            -d DEBUG_INFO_BTF \
+            -d DEBUG_INFO \
+            -d WERROR \
             -e MODULES \
             -e MODVERSIONS \
             -e MEDIA_SUPPORT \
@@ -64,7 +68,7 @@ jobs:
             echo ">> Downloaded official GKI symvers"
             make ARCH=x86_64 LLVM=1 LLVM_IAS=1 O="$W/out" -j"$(nproc)" modules_prepare
           else
-            echo ">> Generating Module.symvers locally from GKI vmlinux (~4 min)..."
+            echo ">> Generating Module.symvers locally from GKI vmlinux (~3-4 min)..."
             make ARCH=x86_64 LLVM=1 LLVM_IAS=1 O="$W/out" -j"$(nproc)" vmlinux
           fi
 
