@@ -12,19 +12,15 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends git curl bc bison flex libssl-dev libelf-dev python3 kmod cpio xz-utils zstd lz4 make gcc
+          sudo apt-get install -y --no-install-recommends git curl bc bison flex libssl-dev libelf-dev python3 kmod cpio xz-utils zstd lz4 make gcc clang lld llvm
       - name: Build v4l2loopback.ko for GKI 6.18.21 (ab16302624)
         run: |
           set -euo pipefail
           W="$GITHUB_WORKSPACE/v4l2build"
-          mkdir -p "$W/clang" "$W/src" "$W/out"
+          mkdir -p "$W/src" "$W/out"
           BID="16302624"
           REL="6.18.21-android17-5-g3938c8d97142-ab16302624"
           CI="https://ci.android.com/builds/submitted/$BID/kernel_x86_64/latest/raw"
-
-          echo ">> Downloading AOSP clang-r584948c..."
-          curl -fL "https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-r584948c.tar.gz" | tar -xz -C "$W/clang"
-          export PATH="$W/clang/bin:$PATH"
 
           echo ">> Cloning GKI kernel/common @ 3938c8d97142..."
           git init "$W/src"
