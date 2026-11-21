@@ -12,7 +12,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends git curl bc bison flex libssl-dev libelf-dev python3 kmod cpio xz-utils zstd lz4 make gcc clang lld llvm
+          sudo apt-get install -y --no-install-recommends git curl bc bison flex libssl-dev libelf-dev zlib1g-dev libdw-dev liblz4-dev pkg-config openssl rsync python3 kmod cpio xz-utils zstd lz4 make gcc clang lld llvm
       - name: Build v4l2loopback.ko for GKI 6.18.21 (ab16302624)
         run: |
           set -euo pipefail
@@ -57,11 +57,15 @@ jobs:
             -d DEBUG_INFO_BTF \
             -d DEBUG_INFO \
             -d WERROR \
+            -d MODULE_SIG \
             -e MODULES \
             -e MODVERSIONS \
             -e MEDIA_SUPPORT \
             -e VIDEO_DEV
           make ARCH=x86_64 LLVM=1 LLVM_IAS=1 O="$W/out" olddefconfig
+
+          echo ">> Running prepare (-j1 so any error is clear)..."
+          make ARCH=x86_64 LLVM=1 LLVM_IAS=1 O="$W/out" -j1 prepare
 
           echo ">> Fetching or generating Module.symvers..."
           if curl -fsSL "$CI/vmlinux.symvers" -o "$W/out/Module.symvers" || curl -fsSL "$CI/Module.symvers" -o "$W/out/Module.symvers"; then
