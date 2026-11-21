@@ -28,9 +28,6 @@ jobs:
           git -C "$W/src" fetch --depth 1 origin 3938c8d97142d5cf31543aa96f864a2cf832dda0
           git -C "$W/src" checkout FETCH_HEAD
 
-          echo ">> Downloading official GKI Module.symvers..."
-          curl -fL "$CI/Module.symvers" -o "$W/out/Module.symvers"
-
           echo ">> Cloning and patching v4l2loopback (MJPEG depth=16 for Android)..."
           git clone --depth 1 https://github.com/v4l2loopback/v4l2loopback.git "$W/v4l2loopback"
           python3 - "$W/v4l2loopback/v4l2loopback_formats.h" << 'PY'
@@ -49,7 +46,7 @@ jobs:
           print(">> Patched V4L2_PIX_FMT_MJPEG depth 32 -> 16")
           PY
 
-          echo ">> Preparing kernel headers (modules_prepare)..."
+          echo ">> Configuring GKI 6.18.21..."
           cd "$W/src"
           touch protected_module_names_list "$W/out/protected_module_names_list"
           make ARCH=x86_64 LLVM=1 LLVM_IAS=1 O="$W/out" gki_defconfig
@@ -61,10 +58,18 @@ jobs:
             -e MEDIA_SUPPORT \
             -e VIDEO_DEV
           make ARCH=x86_64 LLVM=1 LLVM_IAS=1 O="$W/out" olddefconfig
-          make ARCH=x86_64 LLVM=1 LLVM_IAS=1 O="$W/out" -j"$(nproc)" modules_prepare
+
+          echo ">> Fetching or generating Module.symvers..."
+          if curl -fsSL "$CI/vmlinux.symvers" -o "$W/out/Module.symvers" || curl -fsSL "$CI/Module.symvers" -o "$W/out/Module.symvers"; then
+            echo ">> Downloaded official GKI symvers"
+            make ARCH=x86_64 LLVM=1 LLVM_IAS=1 O="$W/out" -j"$(nproc)" modules_prepare
+          else
+            echo ">> Generating Module.symvers locally from GKI vmlinux (~4 min)..."
+            make ARCH=x86_64 LLVM=1 LLVM_IAS=1 O="$W/out" -j"$(nproc)" vmlinux
+          fi
 
           echo ">> Compiling v4l2loopback.ko..."
-          make ARCH=x86_64 LLVM=1 LLVM_IAS=1 O="$W/out" M="$W/v4l2loopback" KBUILD_EXTRA_SYMBOLS="$W/out/Module.symvers" KBUILD_MODPOST_WARN=1 -j"$(nproc)" modules
+          make ARCH=x86_64 LLVM=1 LLVM_IAS=1 O="$W/out" M="$W/v4l2loopback" KBUILD_MODPOST_WARN=1 -j"$(nproc)" modules
 
           mkdir -p "$GITHUB_WORKSPACE/release"
           cp "$W/v4l2loopback/v4l2loopback.ko" "$GITHUB_WORKSPACE/release/v4l2loopback.ko"
