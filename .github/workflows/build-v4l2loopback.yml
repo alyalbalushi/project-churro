@@ -430,7 +430,7 @@ jobs:
           MODULE_DESCRIPTION("Pixelbook Go VB2 DMABUF Virtual Camera");
           VCAM_C
 
-          printf 'obj-m += atlas_vcam.o\n' > "$W/vcam/Makefile"
+          printf 'obj-m := atlas_vcam.o\n' > "$W/vcam/Kbuild"
 
           echo ">> Configuring GKI 6.18.21 (matching running atlas kernel + kCFI integer normalization)..."
           cd "$W/src"
@@ -470,8 +470,9 @@ jobs:
           grep -E '^(CONFIG_MODULE_SIG|CONFIG_DEBUG_INFO_BTF|CONFIG_CFI|CONFIG_LTO|CONFIG_KPROBES|CONFIG_MODVERSIONS|CONFIG_VIDEOBUF2)' "$W/out/.config" | sort
           grep -q '^CONFIG_CFI_ICALL_NORMALIZE_INTEGERS=y$' "$W/out/.config" || { echo "FATAL: CONFIG_CFI_ICALL_NORMALIZE_INTEGERS not enabled!"; exit 1; }
 
-          echo ">> Running prepare (-j1)..."
-          make ARCH=x86_64 LLVM=1 LLVM_IAS=1 O="$W/out" -j1 prepare
+          echo ">> Running modules_prepare (generates scripts/module.lds)..."
+          make ARCH=x86_64 LLVM=1 LLVM_IAS=1 O="$W/out" -j"$(nproc)" modules_prepare
+          ls -lh "$W/out/scripts/module.lds"
 
           echo ">> Building vmlinux with built-in videobuf2 for exact vmlinux.symvers..."
           make ARCH=x86_64 LLVM=1 LLVM_IAS=1 O="$W/out" -j"$(nproc)" vmlinux
@@ -480,7 +481,7 @@ jobs:
           grep -q "vb2_queue_init" "$W/out/Module.symvers"
 
           echo ">> Compiling atlas_vcam.ko..."
-          make ARCH=x86_64 LLVM=1 LLVM_IAS=1 O="$W/out" M="$W/vcam" -j"$(nproc)" modules
+          make -C "$W/out" ARCH=x86_64 LLVM=1 LLVM_IAS=1 M="$W/vcam" -j"$(nproc)" modules
 
           mkdir -p "$GITHUB_WORKSPACE/release"
           cp "$W/vcam/atlas_vcam.ko" "$GITHUB_WORKSPACE/release/atlas_vcam.ko"
