@@ -49,7 +49,12 @@ jobs:
             sudo cp -rf /build/inputs/KernelSU/uapi /build/inputs/KernelSU/kernel/uapi
           fi
           if [ -f /build/inputs/KernelSU/kernel/Kbuild ]; then
+            KSU_GIT_CNT="$(git -C /build/inputs/KernelSU rev-list --count HEAD 2>/dev/null || echo 3100)"
+            KSU_REAL_VER=$((KSU_GIT_CNT + 30000))
+            [ "$KSU_REAL_VER" -lt 32000 ] && KSU_REAL_VER=33100
+            sudo sed -i "s/KSU_VERSION := 16/KSU_VERSION := ${KSU_REAL_VER}/g; s/KSU_VERSION=16/KSU_VERSION=${KSU_REAL_VER}/g" /build/inputs/KernelSU/kernel/Kbuild
             printf '\nccflags-y += -I/build/inputs/KernelSU -I/build/inputs/KernelSU/kernel -I/build/inputs/KernelSU/kernel/include\n' | sudo tee -a /build/inputs/KernelSU/kernel/Kbuild >/dev/null
+            echo ">> KernelSU Kbuild version pinned to ${KSU_REAL_VER} (instead of fallback 16)"
           fi
           sudo chmod -R a+rX /build/inputs/KernelSU
           chmod +x "$W/project-churro/churro.sh" "$W/project-churro/"*/*.sh 2>/dev/null || true
@@ -151,6 +156,189 @@ jobs:
           if au and not os.path.exists(ap): urllib.request.urlretrieve(au, ap)
           PKD
           chmod 0755 "$FAG/vendor/ksu/ksud" 2>/dev/null || true && chmod 0644 "$FAG/vendor/ksu/manager.apk" 2>/dev/null || true
+          cat << 'AAS' > "$FAG/vendor/ksu/atlas-audio.sh"
+          #!/system/bin/sh
+          for i in $(seq 1 30); do [ -f /sys/class/sound/card1/id ] && [ -f /dev/snd/controlC0 ] && break; sleep 1; done
+          if [ "$(cat /sys/class/sound/card1/id 2>/dev/null)" != "sofrt5682" ]; then
+            printf sofrt5682 > /sys/class/sound/card1/id 2>/dev/null || true
+            mount --bind /vendor/etc/audio/avs_max98373_hdmi/audio_config.xml /vendor/etc/audio/sof-rt5682_alc5682ivs_tas2563/audio_config.xml 2>/dev/null || true
+            mount --bind /vendor/etc/audio/avs_max98373_hdmi/mixer_paths.xml /vendor/etc/audio/sof-rt5682_alc5682ivs_tas2563/mixer_paths.xml 2>/dev/null || true
+            killall dras.core.audio audioserver 2>/dev/null || true
+          fi
+          /vendor/bin/churro-mixer 0; /vendor/bin/churro-mixer 1; /vendor/bin/churro-mixer 2
+          sleep 6
+          /vendor/bin/churro-mixer 0
+          AAS
+          chmod 0755 "$FAG/vendor/ksu/atlas-audio.sh"
+          cat << 'ACS' > "$FAG/vendor/ksu/atlas-camera.sh"
+          #!/system/bin/sh
+          ROOT=/data/adb/camroot
+          [ -d "$ROOT/usr/bin" ] || exit 0
+          for i in $(seq 1 30); do [ -e /dev/media0 ] && break; sleep 1; done
+          if [ ! -e /dev/atlas_vcam_in ] && [ -f /data/adb/atlas_vcam.ko ]; then
+            insmod /data/adb/atlas_vcam.ko video_nr=14 2>/dev/null || true
+            sleep 1
+          fi
+          [ -e /dev/video14 ] && [ -e /dev/atlas_vcam_in ] || exit 0
+          cat << 'YAML' > "$ROOT/usr/share/libcamera/ipa/ipu3/imx208.yaml"
+          %YAML 1.1
+          ---
+          version: 1
+          algorithms:
+            - Agc:
+            - Awb:
+            - BlackLevelCorrection:
+            - Ccm:
+                ccms:
+                  - ct: 3000
+                    ccm: [ 1.38, -0.25, -0.12,
+                          -0.15,  1.19, -0.16,
+                          -0.07, -0.26,  1.38 ]
+                    offsets: [ -495, -325, -695 ]
+                  - ct: 5500
+                    ccm: [ 1.38, -0.25, -0.12,
+                          -0.15,  1.19, -0.16,
+                          -0.07, -0.26,  1.38 ]
+                    offsets: [ -495, -325, -695 ]
+            - ToneMapping:
+          ...
+          YAML
+          grep -q " $ROOT/dev " /proc/mounts || mount --bind /dev "$ROOT/dev"
+          grep -q " $ROOT/proc " /proc/mounts || mount --bind /proc "$ROOT/proc"
+          grep -q " $ROOT/sys " /proc/mounts || mount -t sysfs sysfs "$ROOT/sys"
+          umount /sys/class/video4linux 2>/dev/null || true
+          DEVMM="$(cat /sys/class/video4linux/video14/dev 2>/dev/null || echo 81:21)"
+          MAJ="${DEVMM%:*}"; MIN="${DEVMM#*:}"
+          rm -rf /dev/fake_usb
+          mkdir -p /dev/fake_usb/1-2/1-2:1.0/video4linux/video14 /dev/fake_usb/class
+          printf '\022\001\000\002\357\002\001\100\010\004\122\100\000\001\001\002\000\001\011\002\011\000\001\001\000\200\372' > /dev/fake_usb/1-2/descriptors
+          printf '0408\n' > /dev/fake_usb/1-2/idVendor
+          printf '4052\n' > /dev/fake_usb/1-2/idProduct
+          printf '0100\n' > /dev/fake_usb/1-2/bcdDevice
+          cat << 'UE1' > /dev/fake_usb/1-2/1-2:1.0/uevent
+          DEVTYPE=usb_interface
+          DRIVER=uvcvideo
+          PRODUCT=408/4052/100
+          TYPE=239/2/1
+          INTERFACE=14/1/0
+          MODALIAS=usb:v0408p4052d0100dcEFdsc02dp01ic0Eisc01ip00in00
+          UE1
+          printf 'Pixelbook_Go_Cam\n' > /dev/fake_usb/1-2/1-2:1.0/video4linux/video14/name
+          printf '%s\n' "$DEVMM" > /dev/fake_usb/1-2/1-2:1.0/video4linux/video14/dev
+          printf '0\n' > /dev/fake_usb/1-2/1-2:1.0/video4linux/video14/index
+          printf 'MAJOR=%s\nMINOR=%s\nDEVNAME=video14\n' "$MAJ" "$MIN" > /dev/fake_usb/1-2/1-2:1.0/video4linux/video14/uevent
+          ln -sfn ../.. /dev/fake_usb/1-2/1-2:1.0/video4linux/video14/device
+          ln -sfn /dev/fake_usb/1-2/1-2:1.0/video4linux/video14 /dev/fake_usb/class/video14
+          chmod -R a+rX /dev/fake_usb
+          chmod 666 /dev/video14 /dev/atlas_vcam_in
+          KSUD="$(ls /data/adb/ksud /vendor/ksu/ksud /system/bin/ksud 2>/dev/null | head -n1)"
+          if [ -n "$KSUD" ]; then
+            "$KSUD" sepolicy patch "allow hal_camera_default device file { read open getattr }" >/dev/null 2>&1 || true
+            "$KSUD" sepolicy patch "allow hal_camera_default device dir { read open getattr search }" >/dev/null 2>&1 || true
+            "$KSUD" sepolicy patch "allow hal_camera_default device lnk_file { read getattr }" >/dev/null 2>&1 || true
+          fi
+          mount --bind /dev/fake_usb/class /sys/class/video4linux
+          killall android.hardware.camera.provider-usb-service.android-desktop 2>/dev/null || true
+          [ -f /data/adb/atlas_cam_watch.pid ] && kill "$(cat /data/adb/atlas_cam_watch.pid)" 2>/dev/null || true
+          killall gst-launch-1.0 2>/dev/null || true
+          (
+            echo $$ > /data/adb/atlas_cam_watch.pid
+            IDLE=0; GST_PID=""
+            while true; do
+              HAL_PID="$(pidof android.hardware.camera.provider-usb-service.android-desktop 2>/dev/null)"
+              IN_USE=0
+              [ -n "$HAL_PID" ] && ls -l /proc/$HAL_PID/fd 2>/dev/null | grep -q "/dev/video14" && IN_USE=1
+              if [ "$IN_USE" = "1" ]; then
+                IDLE=0
+                if [ -z "$GST_PID" ] || ! kill -0 "$GST_PID" 2>/dev/null; then
+                  chroot "$ROOT" /bin/sh -c 'export PATH=/usr/sbin:/usr/bin:/sbin:/bin; exec gst-launch-1.0 -q libcamerasrc ! video/x-raw,format=NV12,width=1280,height=720 ! videoconvert ! gamma gamma=0.92 ! videobalance contrast=1.06 saturation=1.04 ! videoscale ! video/x-raw,format=YUY2,width=1920,height=1080,framerate=30/1 ! fdsink fd=3 3>&1 1>&2 | (head -c 82944000 >/dev/null && exec cat > /dev/atlas_vcam_in)' >/data/adb/cam_bridge.log 2>&1 &
+                  GST_PID=$!
+                fi
+              elif [ -n "$GST_PID" ] && kill -0 "$GST_PID" 2>/dev/null; then
+                IDLE=$((IDLE + 1))
+                if [ "$IDLE" -ge 4 ]; then
+                  kill "$GST_PID" 2>/dev/null || true
+                  killall gst-launch-1.0 2>/dev/null || true
+                  GST_PID=""; IDLE=0
+                fi
+              fi
+              sleep 0.5
+            done
+          ) </dev/null >/dev/null 2>&1 &
+          ACS
+          chmod 0755 "$FAG/vendor/ksu/atlas-camera.sh"
+          cat << 'GPU_FX' > "$FAG/vendor/ksu/effect_config_usb_gpu.json"
+          {
+              "stream_manipulators": [
+                  {
+                      "name": "Include",
+                      "config": "/vendor/etc/camera/common_post_process.json"
+                  },
+                  {
+                      "name": "VcEffects",
+                      "config": {
+                          "segmentation_delegate": "LiteRt",
+                          "relighting_delegate": "LiteRt",
+                          "retouch_delegate": "LiteRt",
+                          "segmentation_litert_accelerator": "Gpu",
+                          "relighting_litert_accelerator": "Gpu",
+                          "retouch_litert_accelerator": "Gpu",
+                          "enable_latency_logs": false
+                      }
+                  },
+                  {
+                      "name": "AutoFraming",
+                      "config": {
+                          "process_frame_rate": 0,
+                          "enable_logs": true
+                      }
+                  }
+              ]
+          }
+          GPU_FX
+          chmod 0644 "$FAG/vendor/ksu/effect_config_usb_gpu.json"
+          cat << 'APS' > "$FAG/vendor/ksu/atlas-perf.sh"
+          #!/system/bin/sh
+          # Wait until Android finishes boot so PowerHAL does not overwrite governor
+          while [ "$(getprop sys.boot_completed)" != "1" ]; do sleep 2; done
+          sleep 10
+
+          # 1. CPU: performance governor + EPP + 45% min floor
+          for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+              echo performance > "$f" 2>/dev/null
+          done
+          for f in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do
+              echo performance > "$f" 2>/dev/null
+          done
+          echo 45 > /sys/devices/system/cpu/intel_pstate/min_perf_pct 2>/dev/null
+
+          # 2. Intel UHD 615 GPU: raise min clock from 300 -> 600 MHz (max 950 MHz)
+          echo 600 > /sys/class/drm/card0/gt_min_freq_mhz 2>/dev/null
+          echo 950 > /sys/class/drm/card0/gt_boost_freq_mhz 2>/dev/null
+
+          # 3. Memory: reduce aggressive zram swapping on 16GB RAM
+          echo 30 > /proc/sys/vm/swappiness 2>/dev/null
+          echo 20 > /proc/sys/vm/vfs_cache_pressure 2>/dev/null
+
+          # 4. UI compositor: disable heavy translucent blurs + snappy 0.5x animations
+          settings put global disable_window_blurs 1
+          settings put global window_animation_scale 0.5
+          settings put global transition_animation_scale 0.5
+          settings put global animator_duration_scale 0.5
+
+          # 5. S3 deep sleep: disable spurious USB/Wi-Fi/I2C wakeup sources (keep LID0 + CREC)
+          for dev in XHCI WF00 H015; do
+              if grep -q "^${dev}[[:space:]].*enabled" /proc/acpi/wakeup 2>/dev/null; then
+                  echo "$dev" > /proc/acpi/wakeup 2>/dev/null
+              fi
+          done
+
+          # 6. Camera effects: route LiteRT VcEffects to GPU (no NPU on Amber Lake)
+          if [ -f /vendor/ksu/effect_config_usb_gpu.json ] && ! grep -q /vendor/etc/camera/effect_config_usb.json /proc/mounts; then
+              mount --bind /vendor/ksu/effect_config_usb_gpu.json /vendor/etc/camera/effect_config_usb.json 2>/dev/null
+          fi
+          APS
+          chmod 0755 "$FAG/vendor/ksu/atlas-perf.sh"
           FW="features/firmware-extra/vendor/firmware/intel/avs"
           mkdir -p "$FW/skl" "$FW/kbl"
           cp -rf "$W/deb-fw/extracted/usr/lib/firmware/intel/avs/"* "$W/chromebook-linux-audio/blobs/avs/"* "$FW/" 2>/dev/null || true
@@ -189,7 +377,7 @@ jobs:
           p = "features/audio-generic/churro-mixer.c"
           s = open(p).read()
           sw = 'int sw = ((strstr(name, "Playback Switch") || strstr(name, "Speaker Switch") || strstr(name, "Spk") || strstr(name, "Headphone Switch") || strstr(name, "Sense") || strstr(name, "Enable Switch") || strstr(name, "DHT") || strstr(name, "BDE") || strstr(name, "DACL Switch") || strstr(name, "DACR Switch") || strstr(name, "Capture Switch") || strstr(name, "DMIC")) && !strstr(name, "Beep"));'
-          vol = 'int vol = !strcmp(name, "Master Playback Volume") || !strcmp(name, "DSP") || strstr(name, "Left Speaker") || strstr(name, "Right Speaker") || strstr(name, "Digital Volume") || strstr(name, "Speaker Gain") || strstr(name, "Headphone Volume") || strstr(name, "Capture Volume") || strstr(name, "Mic Volume") || strstr(name, "DMIC");'
+          vol = 'int vol = !strcmp(name, "Master Playback Volume") || strstr(name, "DSP") || strstr(name, "Left Speaker") || strstr(name, "Right Speaker") || strstr(name, "Digital Volume") || strstr(name, "Speaker Gain") || strstr(name, "Headphone Volume") || strstr(name, "Capture Volume") || strstr(name, "Mic Volume") || strstr(name, "DMIC");'
           s = re.sub(r'int\s+sw\s*=[^;]+;', sw, s, count=1, flags=re.S)
           s = re.sub(r'int\s+vol\s*=[^;]+;', vol, s, count=1, flags=re.S)
           open(p, "w").write(s)
@@ -211,20 +399,24 @@ jobs:
           if [ -f "$T/build.prop" ]; then
             BP_CTX="$(getfattr -n security.selinux --only-values "$T/build.prop" 2>/dev/null || echo 'u:object_r:vendor_file:s0')"
             sed -i '/^ro\.surface_flinger\.supports_background_blur=/d; /^ro\.sf\.blurs_are_expensive=/d; /^ro\.launcher\.blur\.appLaunch=/d; /^persist\.sys\.sf\.disable_blurs=/d; /^persist\.bluetooth\.a2dp_offload\.disabled=/d' "$T/build.prop"
-            printf "ro.surface_flinger.supports_background_blur=1\nro.sf.blurs_are_expensive=0\nro.launcher.blur.appLaunch=1\npersist.sys.sf.disable_blurs=0\npersist.bluetooth.a2dp_offload.disabled=false\n" >> "$T/build.prop"
+            printf "ro.surface_flinger.supports_background_blur=0\nro.sf.blurs_are_expensive=1\nro.launcher.blur.appLaunch=0\npersist.sys.sf.disable_blurs=1\npersist.bluetooth.a2dp_offload.disabled=false\n" >> "$T/build.prop"
+          fi
+          if [ -f "$T/etc/camera/effect_config_usb.json" ]; then
+            sed -i 's/"Npu"/"Gpu"/g' "$T/etc/camera/effect_config_usb.json" 2>/dev/null || true
             setfattr -n security.selinux -v "$BP_CTX" "$T/build.prop" 2>/dev/null || true
           fi
           cat << 'ATLAS_XML' > /tmp/atlas_audio_config.xml
           <?xml version="1.0" encoding="utf-8"?>
+          <!-- Project Churro audio-generic: Pixelbook Go (atlas) avs_max98373 + avsdmic + avsda7219 + hdaudioB0D2 -->
           <audio_config>
-                  <SoundCardName>hw:1</SoundCardName>
+                  <SoundCardName>hw:sofrt5682</SoundCardName>
                   <HiFi>
                           <Speaker>
-                                  <PlaybackPCM>hw:1,1</PlaybackPCM>
+                                  <PlaybackPCM>hw:sofrt5682,1</PlaybackPCM>
                                   <DSPLatency>0</DSPLatency>
                           </Speaker>
                           <InternalMic>
-                                  <CapturePCM>hw:0,2</CapturePCM>
+                                  <CapturePCM>hw:avsdmic,2</CapturePCM>
                                   <CaptureChannelMap>
                                           <FL>0</FL>
                                           <FR>1</FR>
@@ -233,35 +425,35 @@ jobs:
                                   <DSPLatency>0</DSPLatency>
                           </InternalMic>
                           <Headphone>
-                                  <PlaybackPCM>hw:2,1</PlaybackPCM>
+                                  <PlaybackPCM>hw:avsda7219,1</PlaybackPCM>
                                   <JackDev>avs_da7219 Headphone</JackDev>
                                   <JackSwitch>2</JackSwitch>
                                   <DSPLatency>0</DSPLatency>
                           </Headphone>
                           <Mic>
-                                  <CapturePCM>hw:2,1</CapturePCM>
+                                  <CapturePCM>hw:avsda7219,1</CapturePCM>
                                   <JackDev>avs_da7219 Mic</JackDev>
                                   <DSPLatency>0</DSPLatency>
                           </Mic>
                           <HDMI1>
-                                  <PlaybackPCM>hw:3,1</PlaybackPCM>
+                                  <PlaybackPCM>hw:hdaudioB0D2,1</PlaybackPCM>
                                   <JackDev>hdaudioB0D2 HDMI/DP,pcm=1</JackDev>
                                   <PlaybackChannels>2</PlaybackChannels>
                           </HDMI1>
                           <HDMI2>
-                                  <PlaybackPCM>hw:3,2</PlaybackPCM>
+                                  <PlaybackPCM>hw:hdaudioB0D2,2</PlaybackPCM>
                                   <JackDev>hdaudioB0D2 HDMI/DP,pcm=2</JackDev>
                                   <PlaybackChannels>2</PlaybackChannels>
                           </HDMI2>
                           <HDMI3>
-                                  <PlaybackPCM>hw:3,3</PlaybackPCM>
+                                  <PlaybackPCM>hw:hdaudioB0D2,3</PlaybackPCM>
                                   <JackDev>hdaudioB0D2 HDMI/DP,pcm=3</JackDev>
                                   <PlaybackChannels>2</PlaybackChannels>
                           </HDMI3>
                   </HiFi>
           </audio_config>
           ATLAS_XML
-          for d in "$A"/sof-rt5682* "$A"/avs* "$A"/MAX98373* "$A"/DA7219*; do
+          for d in "$A"/avs* "$A"/MAX98373* "$A"/DA7219*; do
             [ -d "$d" ] && cp -f /tmp/atlas_audio_config.xml "$d/audio_config.xml"
           done
           rm -f /tmp/atlas_audio_config.xml
@@ -275,6 +467,7 @@ jobs:
               printf "(allow get_variant_audio %s (dir (ioctl read getattr lock open watch watch_reads search)))\n(allow get_variant_audio %s (file (ioctl read write getattr lock append map open watch watch_reads)))\n(allow get_variant_audio %s (lnk_file (ioctl read getattr lock map open watch watch_reads)))\n" "$t" "$t" "$t" >> "$S/vendor_sepolicy.cil"
             done
             printf "(allow get_variant_audio input_device (dir (ioctl read getattr lock open watch watch_reads search)))\n(allow get_variant_audio input_device (chr_file (ioctl read getattr lock open watch watch_reads)))\n" >> "$S/vendor_sepolicy.cil"
+            printf "(allow hal_camera_default device (dir (read open getattr search)))\n(allow hal_camera_default device (file (read open getattr)))\n(allow hal_camera_default device (lnk_file (read getattr)))\n" >> "$S/vendor_sepolicy.cil"
           fi
           VE
           cat << 'AR' > "$FAG/vendor/etc/init/init.churro.atlas.rc"
@@ -286,21 +479,28 @@ jobs:
               mkdir /data/adb 0700 root root
               mkdir /data/adb/ksu 0700 root root
               mkdir /data/adb/ksu/bin 0700 root root
+              mkdir /data/adb/service.d 0755 root root
               copy /vendor/ksu/ksud /data/adb/ksud
               copy /vendor/ksu/ksud /data/adb/ksu/bin/ksud
+              copy /vendor/ksu/atlas-audio.sh /data/adb/service.d/atlas-audio.sh
+              copy /vendor/ksu/atlas-camera.sh /data/adb/service.d/atlas-camera.sh
+              copy /vendor/ksu/atlas-perf.sh /data/adb/service.d/atlas-perf.sh
               chmod 0755 /data/adb/ksud
               chmod 0755 /data/adb/ksu/bin/ksud
+              chmod 0755 /data/adb/service.d/atlas-audio.sh
+              chmod 0755 /data/adb/service.d/atlas-camera.sh
+              chmod 0755 /data/adb/service.d/atlas-perf.sh
           on property:sys.boot_completed=1
               setprop persist.bluetooth.a2dp_offload.disabled false
-              setprop persist.sys.sf.disable_blurs 0
+              setprop persist.sys.sf.disable_blurs 1
               setprop service.adb.tcp.port 5555
               setprop persist.adb.tcp.port 5555
               write /sys/power/mem_sleep deep
               chmod 0666 /sys/class/leds/chromeos::kbd_backlight/brightness
               write /sys/class/leds/chromeos::kbd_backlight/brightness 40
-              exec u:r:get_variant_audio:s0 -- /vendor/bin/churro-mixer 0
-              exec u:r:get_variant_audio:s0 -- /vendor/bin/churro-mixer 1
-              exec u:r:get_variant_audio:s0 -- /vendor/bin/churro-mixer 2
+              exec u:r:get_variant_audio:s0 system audio -- /vendor/bin/churro-mixer 0
+              exec u:r:get_variant_audio:s0 system audio -- /vendor/bin/churro-mixer 1
+              exec u:r:get_variant_audio:s0 system audio -- /vendor/bin/churro-mixer 2
               copy /vendor/ksu/manager.apk /data/local/tmp/ksu-manager.apk
               chmod 0644 /data/local/tmp/ksu-manager.apk
               exec - root root -- /system/bin/pm install -r /data/local/tmp/ksu-manager.apk
@@ -346,7 +546,7 @@ jobs:
         with:
           tag_name: churro-atlas-${{ github.run_number }}
           name: "Project Churro for Pixelbook Go (ATLAS) — Build #${{ github.run_number }}"
-          body: "Project Churro (Android 17) for Pixelbook Go (ATLAS) with Audio, Mic, Keyboard Backlight, Blur, Deep Sleep & KernelSU."
+          body: "Project Churro (Android 17) for Pixelbook Go (ATLAS) with Audio, Mic, Built-in 1080p Camera (GPU Effects), Keyboard Backlight, S3 Deep Sleep Wakeup Fix, UHD 615 Performance Tuning & KernelSU (fixed version)."
           files: |
             cb/project-churro/out/churro-pixelbook-go-atlas.img.gz.part-*
             cb/project-churro/out/KernelSU_Manager.apk
