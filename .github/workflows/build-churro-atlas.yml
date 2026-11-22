@@ -57,6 +57,380 @@ jobs:
             echo ">> KernelSU Kbuild version pinned to ${KSU_REAL_VER} (instead of fallback 16)"
           fi
           sudo chmod -R a+rX /build/inputs/KernelSU
+          sudo rm -rf /build/inputs/atlas_vcam /build/inputs/atlas_vcam.ko
+          sudo mkdir -p /build/inputs/atlas_vcam
+          sudo tee /build/inputs/atlas_vcam/atlas_vcam.c >/dev/null << 'VCAM_C'
+          #include <linux/module.h>
+          #include <linux/kernel.h>
+          #include <linux/init.h>
+          #include <linux/mutex.h>
+          #include <linux/spinlock.h>
+          #include <linux/list.h>
+          #include <linux/vmalloc.h>
+          #include <linux/uaccess.h>
+          #include <linux/miscdevice.h>
+          #include <linux/ktime.h>
+          #include <linux/videodev2.h>
+          #include <media/v4l2-device.h>
+          #include <media/v4l2-ioctl.h>
+          #include <media/v4l2-fh.h>
+          #include <media/videobuf2-v4l2.h>
+          #include <media/videobuf2-vmalloc.h>
+
+          #define VCAM_WIDTH   1920
+          #define VCAM_HEIGHT  1080
+          #define VCAM_BPL     (VCAM_WIDTH * 2)
+          #define VCAM_SIZE    (VCAM_BPL * VCAM_HEIGHT)
+
+          static int video_nr = 14;
+          module_param(video_nr, int, 0444);
+
+          struct vcam_buf {
+          	struct vb2_v4l2_buffer vb;
+          	struct list_head list;
+          };
+
+          struct vcam_dev {
+          	struct v4l2_device v4l2_dev;
+          	struct video_device vdev;
+          	struct vb2_queue queue;
+          	struct mutex lock;
+          	struct mutex write_lock;
+          	spinlock_t qlock;
+          	struct list_head buf_list;
+          	u8 *in_buf;
+          	size_t in_pos;
+          	u32 sequence;
+          	bool streaming;
+          };
+
+          static struct vcam_dev *g_dev;
+
+          static int vcam_queue_setup(struct vb2_queue *vq, unsigned int *nbuffers,
+          			    unsigned int *nplanes, unsigned int sizes[],
+          			    struct device *alloc_devs[])
+          {
+          	if (*nplanes)
+          		return sizes[0] < VCAM_SIZE ? -EINVAL : 0;
+          	*nplanes = 1;
+          	sizes[0] = VCAM_SIZE;
+          	return 0;
+          }
+
+          static int vcam_buf_prepare(struct vb2_buffer *vb)
+          {
+          	if (vb2_plane_size(vb, 0) < VCAM_SIZE)
+          		return -EINVAL;
+          	vb2_set_plane_payload(vb, 0, VCAM_SIZE);
+          	return 0;
+          }
+
+          static void vcam_buf_queue(struct vb2_buffer *vb)
+          {
+          	struct vcam_dev *dev = vb2_get_drv_priv(vb->vb2_queue);
+          	struct vcam_buf *buf = container_of(to_vb2_v4l2_buffer(vb), struct vcam_buf, vb);
+          	unsigned long flags;
+
+          	spin_lock_irqsave(&dev->qlock, flags);
+          	list_add_tail(&buf->list, &dev->buf_list);
+          	spin_unlock_irqrestore(&dev->qlock, flags);
+          }
+
+          static int vcam_start_streaming(struct vb2_queue *vq, unsigned int count)
+          {
+          	struct vcam_dev *dev = vb2_get_drv_priv(vq);
+          	unsigned long flags;
+
+          	spin_lock_irqsave(&dev->qlock, flags);
+          	dev->sequence = 0;
+          	dev->streaming = true;
+          	spin_unlock_irqrestore(&dev->qlock, flags);
+          	return 0;
+          }
+
+          static void vcam_stop_streaming(struct vb2_queue *vq)
+          {
+          	struct vcam_dev *dev = vb2_get_drv_priv(vq);
+          	struct vcam_buf *buf, *tmp;
+          	unsigned long flags;
+
+          	spin_lock_irqsave(&dev->qlock, flags);
+          	dev->streaming = false;
+          	list_for_each_entry_safe(buf, tmp, &dev->buf_list, list) {
+          		list_del(&buf->list);
+          		vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_ERROR);
+          	}
+          	spin_unlock_irqrestore(&dev->qlock, flags);
+          }
+
+          static const struct vb2_ops vcam_vb2_ops = {
+          	.queue_setup     = vcam_queue_setup,
+          	.buf_prepare     = vcam_buf_prepare,
+          	.buf_queue       = vcam_buf_queue,
+          	.start_streaming = vcam_start_streaming,
+          	.stop_streaming  = vcam_stop_streaming,
+          };
+
+          static int vcam_querycap(struct file *file, void *fh, struct v4l2_capability *cap)
+          {
+          	strscpy(cap->driver, "uvcvideo", sizeof(cap->driver));
+          	strscpy(cap->card, "Pixelbook_Go_Cam", sizeof(cap->card));
+          	strscpy(cap->bus_info, "usb-0000:00:14.0-2", sizeof(cap->bus_info));
+          	return 0;
+          }
+
+          static int vcam_enum_fmt(struct file *file, void *fh, struct v4l2_fmtdesc *f)
+          {
+          	if (f->index > 0)
+          		return -EINVAL;
+          	f->pixelformat = V4L2_PIX_FMT_YUYV;
+          	strscpy(f->description, "YUYV 4:2:2", sizeof(f->description));
+          	return 0;
+          }
+
+          static int vcam_fill_fmt(struct v4l2_format *f)
+          {
+          	f->fmt.pix.width = VCAM_WIDTH;
+          	f->fmt.pix.height = VCAM_HEIGHT;
+          	f->fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+          	f->fmt.pix.field = V4L2_FIELD_NONE;
+          	f->fmt.pix.bytesperline = VCAM_BPL;
+          	f->fmt.pix.sizeimage = VCAM_SIZE;
+          	f->fmt.pix.colorspace = V4L2_COLORSPACE_REC709;
+          	f->fmt.pix.xfer_func = V4L2_XFER_FUNC_SRGB;
+          	f->fmt.pix.ycbcr_enc = V4L2_YCBCR_ENC_601;
+          	f->fmt.pix.quantization = V4L2_QUANTIZATION_LIM_RANGE;
+          	return 0;
+          }
+
+          static int vcam_g_fmt(struct file *file, void *fh, struct v4l2_format *f)
+          {
+          	return vcam_fill_fmt(f);
+          }
+
+          static int vcam_try_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
+          {
+          	return vcam_fill_fmt(f);
+          }
+
+          static int vcam_enum_framesizes(struct file *file, void *fh, struct v4l2_frmsizeenum *fsize)
+          {
+          	if (fsize->index > 0 || fsize->pixel_format != V4L2_PIX_FMT_YUYV)
+          		return -EINVAL;
+          	fsize->type = V4L2_FRMSIZE_TYPE_DISCRETE;
+          	fsize->discrete.width = VCAM_WIDTH;
+          	fsize->discrete.height = VCAM_HEIGHT;
+          	return 0;
+          }
+
+          static int vcam_enum_frameintervals(struct file *file, void *fh, struct v4l2_frmivalenum *fival)
+          {
+          	if (fival->index > 0 || fival->pixel_format != V4L2_PIX_FMT_YUYV ||
+          	    fival->width != VCAM_WIDTH || fival->height != VCAM_HEIGHT)
+          		return -EINVAL;
+          	fival->type = V4L2_FRMIVAL_TYPE_DISCRETE;
+          	fival->discrete.numerator = 1;
+          	fival->discrete.denominator = 30;
+          	return 0;
+          }
+
+          static int vcam_g_s_parm(struct file *file, void *fh, struct v4l2_streamparm *parm)
+          {
+          	if (parm->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
+          		return -EINVAL;
+          	parm->parm.capture.capability = V4L2_CAP_TIMEPERFRAME;
+          	parm->parm.capture.timeperframe.numerator = 1;
+          	parm->parm.capture.timeperframe.denominator = 30;
+          	parm->parm.capture.readbuffers = 4;
+          	return 0;
+          }
+
+          static const struct v4l2_ioctl_ops vcam_ioctl_ops = {
+          	.vidioc_querycap             = vcam_querycap,
+          	.vidioc_enum_fmt_vid_cap     = vcam_enum_fmt,
+          	.vidioc_g_fmt_vid_cap        = vcam_g_fmt,
+          	.vidioc_try_fmt_vid_cap      = vcam_try_s_fmt,
+          	.vidioc_s_fmt_vid_cap        = vcam_try_s_fmt,
+          	.vidioc_enum_framesizes      = vcam_enum_framesizes,
+          	.vidioc_enum_frameintervals  = vcam_enum_frameintervals,
+          	.vidioc_g_parm               = vcam_g_s_parm,
+          	.vidioc_s_parm               = vcam_g_s_parm,
+          	.vidioc_reqbufs              = vb2_ioctl_reqbufs,
+          	.vidioc_querybuf             = vb2_ioctl_querybuf,
+          	.vidioc_qbuf                 = vb2_ioctl_qbuf,
+          	.vidioc_dqbuf                = vb2_ioctl_dqbuf,
+          	.vidioc_expbuf               = vb2_ioctl_expbuf,
+          	.vidioc_create_bufs          = vb2_ioctl_create_bufs,
+          	.vidioc_prepare_buf          = vb2_ioctl_prepare_buf,
+          	.vidioc_streamon             = vb2_ioctl_streamon,
+          	.vidioc_streamoff            = vb2_ioctl_streamoff,
+          };
+
+          static const struct v4l2_file_operations vcam_fops = {
+          	.owner          = THIS_MODULE,
+          	.open           = v4l2_fh_open,
+          	.release        = vb2_fop_release,
+          	.poll           = vb2_fop_poll,
+          	.unlocked_ioctl = video_ioctl2,
+          	.mmap           = vb2_fop_mmap,
+          };
+
+          static int vcam_in_open(struct inode *inode, struct file *file)
+          {
+          	mutex_lock(&g_dev->write_lock);
+          	g_dev->in_pos = 0;
+          	mutex_unlock(&g_dev->write_lock);
+          	return 0;
+          }
+
+          static ssize_t vcam_in_write(struct file *file, const char __user *ubuf,
+          			     size_t count, loff_t *ppos)
+          {
+          	size_t remaining = count;
+          	size_t copied = 0;
+
+          	mutex_lock(&g_dev->write_lock);
+          	while (remaining > 0) {
+          		size_t space = VCAM_SIZE - g_dev->in_pos;
+          		size_t chunk = remaining < space ? remaining : space;
+
+          		if (copy_from_user(g_dev->in_buf + g_dev->in_pos, ubuf + copied, chunk)) {
+          			mutex_unlock(&g_dev->write_lock);
+          			return -EFAULT;
+          		}
+          		g_dev->in_pos += chunk;
+          		copied += chunk;
+          		remaining -= chunk;
+
+          		if (g_dev->in_pos == VCAM_SIZE) {
+          			struct vcam_buf *buf = NULL;
+          			unsigned long flags;
+
+          			spin_lock_irqsave(&g_dev->qlock, flags);
+          			if (g_dev->streaming && !list_empty(&g_dev->buf_list)) {
+          				buf = list_first_entry(&g_dev->buf_list, struct vcam_buf, list);
+          				list_del(&buf->list);
+          			}
+          			spin_unlock_irqrestore(&g_dev->qlock, flags);
+
+          			if (buf) {
+          				void *vaddr = vb2_plane_vaddr(&buf->vb.vb2_buf, 0);
+          				if (vaddr)
+          					memcpy(vaddr, g_dev->in_buf, VCAM_SIZE);
+          				buf->vb.vb2_buf.timestamp = ktime_get_ns();
+          				buf->vb.sequence = g_dev->sequence++;
+          				buf->vb.field = V4L2_FIELD_NONE;
+          				vb2_set_plane_payload(&buf->vb.vb2_buf, 0, VCAM_SIZE);
+          				vb2_buffer_done(&buf->vb.vb2_buf, VB2_BUF_STATE_DONE);
+          			}
+          			g_dev->in_pos = 0;
+          		}
+          	}
+          	mutex_unlock(&g_dev->write_lock);
+          	return copied;
+          }
+
+          static const struct file_operations vcam_in_fops = {
+          	.owner = THIS_MODULE,
+          	.open  = vcam_in_open,
+          	.write = vcam_in_write,
+          };
+
+          static struct miscdevice vcam_in_misc = {
+          	.minor = MISC_DYNAMIC_MINOR,
+          	.name  = "atlas_vcam_in",
+          	.fops  = &vcam_in_fops,
+          	.mode  = 0666,
+          };
+
+          static int __init atlas_vcam_init(void)
+          {
+          	struct vb2_queue *q;
+          	int ret;
+
+          	g_dev = kzalloc(sizeof(*g_dev), GFP_KERNEL);
+          	if (!g_dev)
+          		return -ENOMEM;
+
+          	g_dev->in_buf = vmalloc(VCAM_SIZE);
+          	if (!g_dev->in_buf) {
+          		kfree(g_dev);
+          		return -ENOMEM;
+          	}
+
+          	mutex_init(&g_dev->lock);
+          	mutex_init(&g_dev->write_lock);
+          	spin_lock_init(&g_dev->qlock);
+          	INIT_LIST_HEAD(&g_dev->buf_list);
+
+          	strscpy(g_dev->v4l2_dev.name, "atlas_vcam", sizeof(g_dev->v4l2_dev.name));
+          	ret = v4l2_device_register(NULL, &g_dev->v4l2_dev);
+          	if (ret)
+          		goto err_vfree;
+
+          	q = &g_dev->queue;
+          	q->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+          	q->io_modes = VB2_MMAP | VB2_DMABUF | VB2_USERPTR;
+          	q->drv_priv = g_dev;
+          	q->buf_struct_size = sizeof(struct vcam_buf);
+          	q->ops = &vcam_vb2_ops;
+          	q->mem_ops = &vb2_vmalloc_memops;
+          	q->timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+          	q->min_queued_buffers = 1;
+          	q->lock = &g_dev->lock;
+
+          	ret = vb2_queue_init(q);
+          	if (ret)
+          		goto err_v4l2;
+
+          	strscpy(g_dev->vdev.name, "Pixelbook_Go_Cam", sizeof(g_dev->vdev.name));
+          	g_dev->vdev.v4l2_dev = &g_dev->v4l2_dev;
+          	g_dev->vdev.fops = &vcam_fops;
+          	g_dev->vdev.ioctl_ops = &vcam_ioctl_ops;
+          	g_dev->vdev.release = video_device_release_empty;
+          	g_dev->vdev.queue = q;
+          	g_dev->vdev.lock = &g_dev->lock;
+          	g_dev->vdev.device_caps = V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_STREAMING;
+          	video_set_drvdata(&g_dev->vdev, g_dev);
+
+          	ret = video_register_device(&g_dev->vdev, VFL_TYPE_VIDEO, video_nr);
+          	if (ret)
+          		goto err_v4l2;
+
+          	ret = misc_register(&vcam_in_misc);
+          	if (ret)
+          		goto err_unreg;
+
+          	pr_info("atlas_vcam: registered /dev/video%d + /dev/atlas_vcam_in (1920x1080 YUYV DMABUF)\n",
+          		g_dev->vdev.num);
+          	return 0;
+
+          err_unreg:
+          	video_unregister_device(&g_dev->vdev);
+          err_v4l2:
+          	v4l2_device_unregister(&g_dev->v4l2_dev);
+          err_vfree:
+          	vfree(g_dev->in_buf);
+          	kfree(g_dev);
+          	return ret;
+          }
+
+          static void __exit atlas_vcam_exit(void)
+          {
+          	misc_deregister(&vcam_in_misc);
+          	video_unregister_device(&g_dev->vdev);
+          	v4l2_device_unregister(&g_dev->v4l2_dev);
+          	vfree(g_dev->in_buf);
+          	kfree(g_dev);
+          }
+
+          module_init(atlas_vcam_init);
+          module_exit(atlas_vcam_exit);
+          MODULE_LICENSE("GPL");
+          MODULE_DESCRIPTION("Pixelbook Go VB2 DMABUF Virtual Camera");
+          VCAM_C
+          echo 'obj-m := atlas_vcam.o' | sudo tee /build/inputs/atlas_vcam/Kbuild >/dev/null
+          sudo chmod -R a+rX /build/inputs/atlas_vcam
           chmod +x "$W/project-churro/churro.sh" "$W/project-churro/"*/*.sh 2>/dev/null || true
           cd "$W/deb-fw"
           for p in firmware-intel-sound firmware-intel-misc; do
@@ -130,6 +504,25 @@ jobs:
                 exit 1
               fi
             ;; esac
+            if [ ! -f /build/inputs/atlas_vcam.ko ] && [ -f /build/inputs/atlas_vcam/atlas_vcam.c ]; then
+              SYMV=""
+              for sv in "\$ODIR/Module.symvers" "\$PWD/Module.symvers"; do
+                [ -s "\$sv" ] && grep -q "vb2_queue_init" "\$sv" && SYMV="\$sv" && break
+              done
+              if [ -n "\$SYMV" ]; then
+                MARGS=(); PREV=""
+                for a in "\$@"; do
+                  if [ -n "\$PREV" ]; then MARGS+=("\$a"); PREV=""; continue; fi
+                  case "\$a" in -C|-f|-j|-I|-l) MARGS+=("\$a"); PREV=1 ;; *=*|-*) MARGS+=("\$a") ;; esac
+                done
+                if command make "\${MARGS[@]}" M=/build/inputs/atlas_vcam modules >/tmp/vcam_build.log 2>&1 && [ -f /build/inputs/atlas_vcam/atlas_vcam.ko ]; then
+                  cp -f /build/inputs/atlas_vcam/atlas_vcam.ko /build/inputs/atlas_vcam.ko
+                  echo ">> Built atlas_vcam.ko against exact churro kernel!" >&2
+                else
+                  tail -n 30 /tmp/vcam_build.log 2>/dev/null | sed 's/^/WARN_VCAM: /' >&2
+                fi
+              fi
+            fi
           }
           KW
           tail -n +2 kmod/build-kernel.sh >> kmod/bk.new && mv -f kmod/bk.new kmod/build-kernel.sh && chmod +x kmod/build-kernel.sh
@@ -457,6 +850,7 @@ jobs:
             [ -d "$d" ] && cp -f /tmp/atlas_audio_config.xml "$d/audio_config.xml"
           done
           rm -f /tmp/atlas_audio_config.xml
+          [ -f /build/inputs/atlas_vcam.ko ] && cp -f /build/inputs/atlas_vcam.ko "$T/ksu/atlas_vcam.ko" && chmod 0644 "$T/ksu/atlas_vcam.ko"
           find "$A" "$T/etc/init" "$T/ksu" -exec setfattr -h -n security.selinux -v u:object_r:vendor_configs_file:s0 {} \; 2>/dev/null || true
           [ -f "$T/bin/churro-mixer" ] && setfattr -n security.selinux -v u:object_r:get_variant_audio_exec:s0 "$T/bin/churro-mixer" 2>/dev/null || true
           if [ -f "$F/churro-kbd.c" ]; then
@@ -485,6 +879,8 @@ jobs:
               copy /vendor/ksu/atlas-audio.sh /data/adb/service.d/atlas-audio.sh
               copy /vendor/ksu/atlas-camera.sh /data/adb/service.d/atlas-camera.sh
               copy /vendor/ksu/atlas-perf.sh /data/adb/service.d/atlas-perf.sh
+              copy /vendor/ksu/atlas_vcam.ko /data/adb/atlas_vcam.ko
+              chmod 0644 /data/adb/atlas_vcam.ko
               chmod 0755 /data/adb/ksud
               chmod 0755 /data/adb/ksu/bin/ksud
               chmod 0755 /data/adb/service.d/atlas-audio.sh
@@ -539,6 +935,7 @@ jobs:
           cp -f features/audio-generic/vendor/ksu/manager.apk out/KernelSU_Manager.apk 2>/dev/null || true
           IMG="churro-pixelbook-go-atlas.img"
           sudo -E ./churro.sh auto "$BIN" "out/$IMG" <<< ""
+          [ -f /build/inputs/atlas_vcam.ko ] && cp -f /build/inputs/atlas_vcam.ko out/atlas_vcam.ko || true
           rm -f "$BIN" && sudo rm -rf /var/cache/churro 2>/dev/null || true
           cd out && pigz -p "$(nproc)" -c "$IMG" | split -b 1900M - "$IMG.gz.part-" && rm -f "$IMG" && ls -lh "$IMG.gz.part-"*
       - name: Upload Release
@@ -550,5 +947,6 @@ jobs:
           files: |
             cb/project-churro/out/churro-pixelbook-go-atlas.img.gz.part-*
             cb/project-churro/out/KernelSU_Manager.apk
+            cb/project-churro/out/atlas_vcam.ko
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
